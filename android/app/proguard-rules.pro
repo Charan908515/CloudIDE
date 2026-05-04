@@ -1,0 +1,4 @@
+-keep class com.cloudide.android.data.drive.** { *; }
+-keep class com.google.gson.** { *; }
+-keepattributes Signature
+-keepattributes *Annotation*

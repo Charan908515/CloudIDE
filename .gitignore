@@ -1,0 +1,118 @@
+# =============================================================================
+# Electron Monorepo .gitignore
+# Covers: Electron/Vite/TypeScript (desktop), Node.js backend, Android
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Dependencies
+# -----------------------------------------------------------------------------
+node_modules/
+.pnp
+.pnp.js
+.yarn/install-state.gz
+
+# -----------------------------------------------------------------------------
+# Environment Variables (NEVER commit secrets)
+# -----------------------------------------------------------------------------
+.env
+.env.local
+.env.*.local
+# Keep examples tracked
+!.env.example
+
+# -----------------------------------------------------------------------------
+# Build Outputs
+# -----------------------------------------------------------------------------
+# Desktop (Electron / Vite)
+dist/
+
+# Electron builder artifacts
+*.exe
+*.dmg
+*.AppImage
+*.deb
+*.rpm
+*.snap
+*.msi
+*.pkg
+*.zip
+*.tar.gz
+
+# -----------------------------------------------------------------------------
+# TypeScript
+# -----------------------------------------------------------------------------
+*.tsbuildinfo
+tsconfig.tsbuildinfo
+
+# -----------------------------------------------------------------------------
+# Logs
+# -----------------------------------------------------------------------------
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# -----------------------------------------------------------------------------
+# OS / Editor
+# -----------------------------------------------------------------------------
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# VS Code
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# JetBrains IDEs
+.idea/
+*.iml
+
+# Claude
+.claude/
+
+# -----------------------------------------------------------------------------
+# Android
+# -----------------------------------------------------------------------------
+android/app/build/
+android/.gradle/
+android/local.properties
+android/*.keystore
+android/keystore.properties
+*.jks
+*.keystore
+
+# Android Studio
+android/.idea/
+android/captures/
+android/app/*.iml
+android/gradlew.bat
+android/gradle/
+
+# -----------------------------------------------------------------------------
+# Misc
+# -----------------------------------------------------------------------------
+# Crash reports
+crash-reports/
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Optional: lock files (uncomment if you prefer not to commit them)
+# package-lock.json
+# yarn.lock

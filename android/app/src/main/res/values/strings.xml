@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CloudIDE</string>
+    <string name="sign_in_with_google">Sign in with Google</string>
+    <string name="signing_in">Signing in…</string>
+    <string name="sign_in_failed">Sign-in failed</string>
+    <string name="welcome_title">CloudIDE</string>
+    <string name="welcome_subtitle">Your code, anywhere. Sign in with the same Google account you use on desktop to access your synced projects.</string>
+    <string name="projects_title">Projects</string>
+    <string name="no_projects_title">No projects yet</string>
+    <string name="no_projects_subtitle">Create one here, or push from CloudIDE on desktop and it will appear automatically.</string>
+    <string name="new_project">New project</string>
+    <string name="new_project_dialog_title">Create a new project</string>
+    <string name="new_project_hint">Project name</string>
+    <string name="cancel">Cancel</string>
+    <string name="create">Create</string>
+    <string name="sign_out">Sign out</string>
+    <string name="files_count">%1$d files</string>
+    <string name="last_updated">Updated %1$s</string>
+    <string name="empty_project_title">No files</string>
+    <string name="empty_project_subtitle">This project doesn\'t have any files yet.</string>
+    <string name="loading">Loading…</string>
+    <string name="error_generic">Something went wrong. Pull to retry.</string>
+    <string name="open_with_external">Open with…</string>
+</resources>

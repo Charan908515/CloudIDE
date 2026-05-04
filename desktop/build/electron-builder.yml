@@ -1,0 +1,35 @@
+appId: com.cloudide.desktop
+productName: CloudIDE
+copyright: Copyright © 2024
+
+directories:
+  output: dist/electron
+
+files:
+  - electron/dist/**
+  - renderer/dist/**
+  - node_modules/**
+  - package.json
+
+win:
+  target: nsis
+  icon: assets/icon.ico
+  artifactName: CloudIDE-Setup-${version}.exe
+
+mac:
+  target: dmg
+  icon: assets/icon.icns
+  category: public.app-category.developer-tools
+  hardenedRuntime: true
+  entitlements: build/entitlements.mac.plist
+
+linux:
+  target: AppImage
+  icon: assets/icon.png
+  category: Development
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
