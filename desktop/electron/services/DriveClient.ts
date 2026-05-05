@@ -93,7 +93,7 @@ export class DriveClient {
     return Buffer.from(res.data as ArrayBuffer);
   }
 
-  async listChildren(parentId: string): Promise<Array<{ id: string; name: string; modifiedTime?: string }>> {
+  async listChildren(parentId: string): Promise<Array<{ id: string; name: string; modifiedTime?: string; mimeType: string }>> {
     const res = await this.drive.files.list({
       q: `'${parentId}' in parents and trashed=false`,
       fields: 'files(id,name,modifiedTime,mimeType)',
@@ -103,6 +103,7 @@ export class DriveClient {
       id: f.id ?? '',
       name: f.name ?? '',
       modifiedTime: f.modifiedTime ?? undefined,
+      mimeType: f.mimeType ?? '',
     }));
   }
 

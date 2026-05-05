@@ -8,8 +8,11 @@ import TitleBar from './TitleBar';
 import Splitter from './Splitter';
 import AccountMenu from '../account/AccountMenu';
 import SettingsModal from '../settings/SettingsModal';
+import CloudProjectModal from '../sync/CloudProjectModal';
+import ToastContainer from '../common/ToastContainer';
+import OfflineQueueManager from '../sync/OfflineQueueManager';
 
-type ActivityPanel = 'files' | 'search' | 'git' | 'run' | 'extensions';
+type ActivityPanel = 'files' | 'search' | 'git' | 'run' | 'extensions' | 'cloud';
 
 const SIDEBAR_MIN = 170;
 const SIDEBAR_MAX = 600;
@@ -119,7 +122,6 @@ export default function AppShell() {
         onSelect={handlePanelSelect}
         onAccount={(y) => setAccountAnchorY(y)}
         onSettings={() => setSettingsOpen(true)}
-        onSyncIcon={() => window.dispatchEvent(new CustomEvent('cloudide:openSyncMenu'))}
       />
       <SidePanel activePanel={activePanel} />
       {sidePanelOpen ? <Splitter orientation="vertical" onResize={handleSidebarResize} className="splitter--side" /> : <div className="splitter--side" />}
@@ -133,6 +135,9 @@ export default function AppShell() {
         onClose={() => setAccountAnchorY(null)}
       />
       <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <CloudProjectModal />
+      <ToastContainer />
+      <OfflineQueueManager />
     </div>
   );
 }

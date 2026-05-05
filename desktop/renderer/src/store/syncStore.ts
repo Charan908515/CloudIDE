@@ -12,6 +12,7 @@ interface SyncState {
   diff: SyncDiffResult | null;
   triggers: Set<AutoSyncTrigger>;
   intervalMinutes: number;
+  autoSyncOnCommit: boolean;
   setAuth: (signedIn: boolean, user: AuthUser | null) => void;
   setState: (state: SyncStateName | 'idle', message?: string) => void;
   setMeta: (meta: ProjectSyncMeta | null) => void;
@@ -19,29 +20,31 @@ interface SyncState {
   setDiff: (diff: SyncDiffResult | null) => void;
   toggleTrigger: (trigger: AutoSyncTrigger) => void;
   setIntervalMinutes: (minutes: number) => void;
+  setAutoSyncOnCommit: (value: boolean) => void;
 }
 
 const STORAGE_KEY = 'cloudide-sync-prefs';
 
-function loadPrefs(): { triggers: Set<AutoSyncTrigger>; intervalMinutes: number } {
+function loadPrefs(): { triggers: Set<AutoSyncTrigger>; intervalMinutes: number; autoSyncOnCommit: boolean } {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { triggers: new Set(['manual']), intervalMinutes: 10 };
-    const parsed = JSON.parse(raw) as { triggers?: AutoSyncTrigger[]; intervalMinutes?: number };
+    if (!raw) return { triggers: new Set(['manual']), intervalMinutes: 10, autoSyncOnCommit: false };
+    const parsed = JSON.parse(raw) as { triggers?: AutoSyncTrigger[]; intervalMinutes?: number; autoSyncOnCommit?: boolean };
     return {
       triggers: new Set(parsed.triggers ?? ['manual']),
       intervalMinutes: parsed.intervalMinutes ?? 10,
+      autoSyncOnCommit: parsed.autoSyncOnCommit ?? false,
     };
   } catch {
-    return { triggers: new Set(['manual']), intervalMinutes: 10 };
+    return { triggers: new Set(['manual']), intervalMinutes: 10, autoSyncOnCommit: false };
   }
 }
 
-function savePrefs(triggers: Set<AutoSyncTrigger>, intervalMinutes: number) {
+function savePrefs(triggers: Set<AutoSyncTrigger>, intervalMinutes: number, autoSyncOnCommit: boolean) {
   try {
     localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify({ triggers: Array.from(triggers), intervalMinutes })
+      JSON.stringify({ triggers: Array.from(triggers), intervalMinutes, autoSyncOnCommit })
     );
   } catch {
     /* ignore */
@@ -60,6 +63,7 @@ export const useSyncStore = create<SyncState>((set, get) => ({
   diff: null,
   triggers: initialPrefs.triggers,
   intervalMinutes: initialPrefs.intervalMinutes,
+  autoSyncOnCommit: initialPrefs.autoSyncOnCommit,
   setAuth: (signedIn, user) => set({ signedIn, user }),
   setState: (state, message = '') => set({ state, message }),
   setMeta: (meta) => set({ meta }),
@@ -70,11 +74,15 @@ export const useSyncStore = create<SyncState>((set, get) => ({
     if (next.has(trigger)) next.delete(trigger);
     else next.add(trigger);
     if (next.size === 0) next.add('manual');
-    savePrefs(next, get().intervalMinutes);
+    savePrefs(next, get().intervalMinutes, get().autoSyncOnCommit);
     set({ triggers: next });
   },
   setIntervalMinutes: (minutes) => {
-    savePrefs(get().triggers, minutes);
+    savePrefs(get().triggers, minutes, get().autoSyncOnCommit);
     set({ intervalMinutes: minutes });
+  },
+  setAutoSyncOnCommit: (value) => {
+    savePrefs(get().triggers, get().intervalMinutes, value);
+    set({ autoSyncOnCommit: value });
   },
 }));

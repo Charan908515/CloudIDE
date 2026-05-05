@@ -87,10 +87,25 @@ export default function FileTree() {
     function handle() {
       void handleOpenFolder();
     }
+    function handleOpenSpecific(e: Event) {
+      const targetPath = (e as CustomEvent<string>).detail;
+      if (!targetPath || !bridge?.fs) return;
+      if (rootPath) {
+        try { void bridge.fs.stopWatch(rootPath); } catch { /* ignore */ }
+      }
+      void loadTree(targetPath, true).then(() => {
+        try { void bridge.fs.startWatch(targetPath); } catch { /* ignore */ }
+      });
+    }
+
     window.addEventListener('cloudide:openFolder', handle);
-    return () => window.removeEventListener('cloudide:openFolder', handle);
+    window.addEventListener('cloudide:openSpecificFolder', handleOpenSpecific);
+    return () => {
+      window.removeEventListener('cloudide:openFolder', handle);
+      window.removeEventListener('cloudide:openSpecificFolder', handleOpenSpecific);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rootPath]);
+  }, [rootPath, bridge]);
 
   async function handleCreateProject() {
     if (!bridge?.fs || !rootPath) return;

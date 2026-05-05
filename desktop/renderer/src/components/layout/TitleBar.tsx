@@ -53,6 +53,7 @@ function buildMenus(): MenuDef[] {
         { kind: 'item', label: 'New File', shortcut: 'Ctrl+N', action: newFileAction },
         { kind: 'separator' },
         { kind: 'item', label: 'Open Folder...', shortcut: 'Ctrl+K Ctrl+O', action: () => dispatch('cloudide:openFolder') },
+        { kind: 'item', label: 'Clone Cloud Project...', action: () => dispatch('cloudide:cloneCloudProject') },
         { kind: 'separator' },
         { kind: 'item', label: 'Save', shortcut: 'Ctrl+S', action: () => void saveActiveAction() },
         { kind: 'item', label: 'Close Editor', shortcut: 'Ctrl+W', action: closeActiveAction },

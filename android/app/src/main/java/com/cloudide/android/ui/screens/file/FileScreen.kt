@@ -32,13 +32,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
@@ -61,21 +59,22 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 private data class EditorUiState(
-    val loading: Boolean = true,
-    val saving: Boolean = false,
-    val original: String = "",
-    val current: String = "",
-    val error: String? = null,
+        val loading: Boolean = true,
+        val saving: Boolean = false,
+        val original: String = "",
+        val current: String = "",
+        val error: String? = null,
 )
 
 private class EditorViewModel(
-    private val cache: LocalProjectCache,
-    private val relativePath: String,
+        private val cache: LocalProjectCache,
+        private val relativePath: String,
 ) : ViewModel() {
     private val _state = MutableStateFlow(EditorUiState())
     val state: StateFlow<EditorUiState> = _state.asStateFlow()
 
-    val dirty: Boolean get() = _state.value.current != _state.value.original
+    val dirty: Boolean
+        get() = _state.value.current != _state.value.original
 
     fun load() {
         viewModelScope.launch {
@@ -90,17 +89,22 @@ private class EditorViewModel(
     }
 
     fun save(onSaved: () -> Unit) {
-        if (!dirty) { onSaved(); return }
+        if (!dirty) {
+            onSaved()
+            return
+        }
         viewModelScope.launch {
             _state.update { it.copy(saving = true) }
             runCatching { cache.writeText(relativePath, _state.value.current) }
-                .onSuccess {
-                    _state.update { it.copy(saving = false, original = it.current) }
-                    onSaved()
-                }
-                .onFailure { ex ->
-                    _state.update { it.copy(saving = false, error = ex.message ?: "Save failed") }
-                }
+                    .onSuccess {
+                        _state.update { it.copy(saving = false, original = it.current) }
+                        onSaved()
+                    }
+                    .onFailure { ex ->
+                        _state.update {
+                            it.copy(saving = false, error = ex.message ?: "Save failed")
+                        }
+                    }
         }
     }
 }
@@ -108,19 +112,22 @@ private class EditorViewModel(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FileScreen(
-    app: CloudIdeApp,
-    projectFolderId: String,
-    relativePath: String,
-    fileName: String,
-    onBack: () -> Unit,
+        app: CloudIdeApp,
+        projectFolderId: String,
+        relativePath: String,
+        fileName: String,
+        onBack: () -> Unit,
 ) {
-    val cache = remember(projectFolderId) { LocalProjectCache(app.applicationContext, projectFolderId) }
-    val vm: EditorViewModel = viewModel(
-        key = "$projectFolderId|$relativePath",
-        factory = viewModelFactory {
-            initializer { EditorViewModel(cache, relativePath) }
-        }
-    )
+    val cache =
+            remember(projectFolderId) { LocalProjectCache(app.applicationContext, projectFolderId) }
+    val vm: EditorViewModel =
+            viewModel(
+                    key = "$projectFolderId|$relativePath",
+                    factory =
+                            viewModelFactory {
+                                initializer { EditorViewModel(cache, relativePath) }
+                            }
+            )
     LaunchedEffect(relativePath) { vm.load() }
 
     val state by vm.state.collectAsState()
@@ -128,79 +135,98 @@ fun FileScreen(
     val scope = rememberCoroutineScope()
 
     Scaffold(
-        topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(fileName, style = MaterialTheme.typography.titleMedium)
-                            if (state.original != state.current) {
-                                Spacer(Modifier.width(8.dp))
-                                Box(
-                                    modifier = Modifier
-                                        .size(8.dp)
-                                        .background(MaterialTheme.colorScheme.primary, androidx.compose.foundation.shape.CircleShape)
+            topBar = {
+                TopAppBar(
+                        title = {
+                            Column {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(fileName, style = MaterialTheme.typography.titleMedium)
+                                    if (state.original != state.current) {
+                                        Spacer(Modifier.width(8.dp))
+                                        Box(
+                                                modifier =
+                                                        Modifier.size(8.dp)
+                                                                .background(
+                                                                        MaterialTheme.colorScheme
+                                                                                .primary,
+                                                                        androidx.compose.foundation
+                                                                                .shape.CircleShape
+                                                                )
+                                        )
+                                    }
+                                }
+                                Text(
+                                        "${state.current.lines().size} lines · ${state.current.length} chars",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                             }
-                        }
-                        Text(
-                            "${state.current.lines().size} lines · ${state.current.length} chars",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = "Back")
-                    }
-                },
-                actions = {
-                    IconButton(
-                        onClick = {
-                            vm.save {
-                                scope.launch { snackHost.showSnackbar("Saved locally · sync from Project to push") }
+                        },
+                        navigationIcon = {
+                            IconButton(onClick = onBack) {
+                                Icon(
+                                        Icons.AutoMirrored.Outlined.ArrowBack,
+                                        contentDescription = "Back"
+                                )
                             }
                         },
-                        enabled = state.original != state.current && !state.saving,
-                    ) {
-                        if (state.saving) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(20.dp), strokeWidth = 2.dp,
-                            )
-                        } else {
-                            Icon(Icons.Outlined.Save, contentDescription = "Save")
-                        }
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.background
-                ),
-            )
-        },
-        snackbarHost = { SnackbarHost(snackHost) },
-        containerColor = MaterialTheme.colorScheme.background,
+                        actions = {
+                            IconButton(
+                                    onClick = {
+                                        vm.save {
+                                            scope.launch {
+                                                snackHost.showSnackbar(
+                                                        "Saved locally · sync from Project to push"
+                                                )
+                                            }
+                                        }
+                                    },
+                                    enabled = state.original != state.current && !state.saving,
+                            ) {
+                                if (state.saving) {
+                                    CircularProgressIndicator(
+                                            modifier = Modifier.size(20.dp),
+                                            strokeWidth = 2.dp,
+                                    )
+                                } else {
+                                    Icon(Icons.Outlined.Save, contentDescription = "Save")
+                                }
+                            }
+                        },
+                        colors =
+                                TopAppBarDefaults.topAppBarColors(
+                                        containerColor = MaterialTheme.colorScheme.background
+                                ),
+                )
+            },
+            snackbarHost = { SnackbarHost(snackHost) },
+            containerColor = MaterialTheme.colorScheme.background,
     ) { padding ->
         Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding),
+                modifier = Modifier.fillMaxSize().padding(padding),
         ) {
             when {
-                state.loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
-                }
-                state.error != null -> Box(
-                    Modifier.fillMaxSize().padding(24.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(state.error!!, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center)
-                }
-                else -> EditorBody(
-                    text = state.current,
-                    onChange = vm::update,
-                    fileName = fileName,
-                )
+                state.loading ->
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+                        }
+                state.error != null ->
+                        Box(
+                                Modifier.fillMaxSize().padding(24.dp),
+                                contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                    state.error!!,
+                                    color = MaterialTheme.colorScheme.error,
+                                    textAlign = TextAlign.Center
+                            )
+                        }
+                else ->
+                        EditorBody(
+                                text = state.current,
+                                onChange = vm::update,
+                                fileName = fileName,
+                        )
             }
         }
     }
@@ -211,46 +237,47 @@ private fun EditorBody(text: String, onChange: (String) -> Unit, fileName: Strin
     val lineNumbers = remember(text) { (1..text.lines().size.coerceAtLeast(1)).toList() }
     val verticalScroll = rememberScrollState()
     val horizontalScroll = rememberScrollState()
-    val style = TextStyle(
-        fontFamily = FontFamily.Monospace,
-        fontSize = 14.sp,
-        lineHeight = 20.sp,
-        color = MaterialTheme.colorScheme.onSurface,
-    )
+    val style =
+            TextStyle(
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
+                    color = MaterialTheme.colorScheme.onSurface,
+            )
     val highlighter = remember(fileName) { highlighterForFileName(fileName) }
     val transform = remember(highlighter) { SyntaxHighlightTransformation(highlighter) }
 
     Row(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.surface)
-            .verticalScroll(verticalScroll),
+            modifier =
+                    Modifier.fillMaxSize()
+                            .background(MaterialTheme.colorScheme.surface)
+                            .verticalScroll(verticalScroll),
     ) {
         Column(
-            modifier = Modifier
-                .background(MaterialTheme.colorScheme.surfaceContainerHigh)
-                .padding(horizontal = 10.dp, vertical = 8.dp),
+                modifier =
+                        Modifier.background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                                .padding(horizontal = 10.dp, vertical = 8.dp),
         ) {
             for (n in lineNumbers) {
                 Text(
-                    text = n.toString().padStart(4, ' '),
-                    style = style.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
+                        text = n.toString().padStart(4, ' '),
+                        style = style.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
                 )
             }
         }
         Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(horizontalScroll)
-                .padding(horizontal = 12.dp, vertical = 8.dp),
+                modifier =
+                        Modifier.fillMaxWidth()
+                                .horizontalScroll(horizontalScroll)
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
         ) {
             BasicTextField(
-                value = text,
-                onValueChange = onChange,
-                textStyle = style,
-                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-                visualTransformation = transform,
-                modifier = Modifier.fillMaxSize(),
+                    value = text,
+                    onValueChange = onChange,
+                    textStyle = style,
+                    cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                    visualTransformation = transform,
+                    modifier = Modifier.fillMaxSize(),
             )
         }
     }

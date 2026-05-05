@@ -151,8 +151,10 @@ function EditorSettings() {
 function SyncSettings() {
   const triggers = useSyncStore((s) => s.triggers);
   const intervalMinutes = useSyncStore((s) => s.intervalMinutes);
+  const autoSyncOnCommit = useSyncStore((s) => s.autoSyncOnCommit);
   const toggleTrigger = useSyncStore((s) => s.toggleTrigger);
   const setIntervalMinutes = useSyncStore((s) => s.setIntervalMinutes);
+  const setAutoSyncOnCommit = useSyncStore((s) => s.setAutoSyncOnCommit);
   const autoPullOnOpen = useSettingsStore((s) => s.ui.autoPullOnOpen);
   const setUi = useSettingsStore((s) => s.setUi);
 
@@ -193,6 +195,14 @@ function SyncSettings() {
         hint="If the remote is ahead when you open a folder, automatically pull the latest."
         checked={autoPullOnOpen}
         onChange={(v) => setUi('autoPullOnOpen', v)}
+      />
+
+      <h3 className="settings-heading">Version Control</h3>
+      <ToggleField
+        label="Auto-sync to Drive on Git commit"
+        hint="Automatically push changes to Drive whenever you commit via Source Control."
+        checked={autoSyncOnCommit}
+        onChange={(v) => setAutoSyncOnCommit(v)}
       />
     </div>
   );

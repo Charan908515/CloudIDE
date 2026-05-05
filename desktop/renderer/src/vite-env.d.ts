@@ -191,6 +191,8 @@ declare global {
         push(projectRoot: string, projectName?: string, force?: boolean): Promise<SyncResult>;
         pull(projectRoot: string): Promise<SyncResult>;
         unlink(projectRoot: string): Promise<boolean>;
+        listCloudProjects(): Promise<Array<{ id: string; name: string; modifiedTime?: string }> | { error: string }>;
+        cloneCloudProject(driveFolderId: string, projectName: string, localTargetDir: string): Promise<SyncResult>;
         onState(listener: (payload: { state: SyncStateName; message?: string }) => void): () => void;
       };
     };

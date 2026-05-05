@@ -200,6 +200,7 @@ class ProjectViewModel(
         viewModelScope.launch {
             cache.writeText(path, content)
             refresh()
+            push() // Auto-sync to Drive
         }
     }
 
@@ -207,6 +208,7 @@ class ProjectViewModel(
         viewModelScope.launch {
             cache.deleteFile(path)
             refresh()
+            push() // Auto-sync to Drive
         }
     }
 
@@ -215,6 +217,7 @@ class ProjectViewModel(
             if (cache.isDirectory(oldPath)) cache.renameDir(oldPath, newPath)
             else cache.renameFile(oldPath, newPath)
             refresh()
+            push() // Auto-sync to Drive
         }
     }
 
@@ -228,6 +231,7 @@ class ProjectViewModel(
                 cache.deleteFile(path)
             }
             refresh()
+            push() // Auto-sync to Drive
         }
     }
 

@@ -72,4 +72,19 @@ export function registerSyncIpc(
     await sync.unlink(projectRoot);
     return true;
   });
+
+  ipcMain.handle('sync:listCloudProjects', async () => {
+    try {
+      return await sync.listCloudProjects();
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('sync:cloneCloudProject', async (_event, driveFolderId: string, projectName: string, localTargetDir: string) => {
+    const emit = emitTo(getMainWindow());
+    const result = await sync.cloneCloudProject(driveFolderId, projectName, localTargetDir, { emit });
+    if (!result.ok) emit('error', result.error);
+    return result;
+  });
 }

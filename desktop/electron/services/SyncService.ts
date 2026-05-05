@@ -628,6 +628,77 @@ export class SyncService {
       /* ignore */
     }
   }
+
+  async listCloudProjects(): Promise<Array<{ id: string; name: string; modifiedTime?: string }>> {
+    const drive = await this.getDrive();
+    if (!drive) throw new Error('Not signed in to Google Drive');
+    
+    const rootId = await drive.findFolder(desktopConfig.driveRootName);
+    if (!rootId) return [];
+    
+    const children = await drive.listChildren(rootId);
+    // Filter to just folders (since projects are folders)
+    return children.filter(c => c.mimeType === 'application/vnd.google-apps.folder');
+  }
+
+  async cloneCloudProject(
+    driveFolderId: string,
+    projectName: string,
+    localTargetDir: string,
+    options?: PushOptions
+  ): Promise<{ ok: true; manifest: RemoteManifest } | { ok: false; error: string }> {
+    const emit = options?.emit ?? (() => undefined);
+    const drive = await this.getDrive();
+    if (!drive) return { ok: false, error: 'Not signed in to Google Drive' };
+
+    try {
+      // 1. Download manifest
+      emit('downloading', 'Reading remote manifest…');
+      const manifestId = await drive.findFile(REMOTE_MANIFEST_FILE, driveFolderId);
+      if (!manifestId) return { ok: false, error: 'Project manifest not found on Drive. This might not be a valid CloudIDE project.' };
+      
+      const buf = await drive.downloadFile(manifestId);
+      const remote = JSON.parse(buf.toString('utf8')) as RemoteManifest;
+      
+      // 2. Download all files
+      const total = Object.keys(remote.files).length;
+      let downloaded = 0;
+      for (const [relPath, entry] of Object.entries(remote.files)) {
+        downloaded++;
+        emit('downloading', `Downloading ${downloaded}/${total}: ${relPath}`);
+        const fileBuf = await drive.downloadFile(entry.driveFileId);
+        const localPath = path.join(localTargetDir, relPath);
+        await fsp.mkdir(path.dirname(localPath), { recursive: true });
+        await fsp.writeFile(localPath, fileBuf);
+      }
+      
+      // 3. Write local meta
+      emit('downloading', 'Writing local metadata…');
+      const { files: localMap } = await buildLocalFileMap(localTargetDir);
+      // Merge driveFileIds
+      for (const [relPath, info] of Object.entries(localMap)) {
+        if (remote.files[relPath]) {
+          info.driveFileId = remote.files[relPath].driveFileId;
+        }
+      }
+      
+      const meta: LocalProjectMeta = {
+        projectId: remote.projectId,
+        projectName,
+        driveFolderId,
+        lastSyncedVersion: remote.version,
+        lastSyncedAt: Date.now(),
+        machineId: machineId(),
+        files: localMap,
+      };
+      await writeLocalMeta(localTargetDir, meta);
+      
+      emit('success', 'Project cloned successfully');
+      return { ok: true, manifest: remote };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
 }
 
 function buildManifestFromMeta(meta: LocalProjectMeta, projectName: string): RemoteManifest {

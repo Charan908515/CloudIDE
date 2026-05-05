@@ -93,6 +93,9 @@ contextBridge.exposeInMainWorld('cloudide', {
       ipcRenderer.invoke('sync:push', projectRoot, projectName, force ?? false),
     pull: (projectRoot: string) => ipcRenderer.invoke('sync:pull', projectRoot),
     unlink: (projectRoot: string) => ipcRenderer.invoke('sync:unlink', projectRoot),
+    listCloudProjects: () => ipcRenderer.invoke('sync:listCloudProjects'),
+    cloneCloudProject: (driveFolderId: string, projectName: string, localTargetDir: string) =>
+      ipcRenderer.invoke('sync:cloneCloudProject', driveFolderId, projectName, localTargetDir),
     onState: (listener: (payload: { state: string; message?: string }) => void) => {
       const wrapped = (_event: unknown, payload: { state: string; message?: string }) => listener(payload);
       ipcRenderer.on('sync:state', wrapped);

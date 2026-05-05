@@ -1,7 +1,7 @@
 import { MutableRefObject, useRef } from 'react';
 import Codicon from '../common/Codicon';
 
-type ActivityPanel = 'files' | 'search' | 'git' | 'run' | 'extensions';
+type ActivityPanel = 'files' | 'search' | 'git' | 'run' | 'extensions' | 'cloud';
 
 interface ActivityBarProps {
   activePanel: ActivityPanel;
@@ -11,7 +11,6 @@ interface ActivityBarProps {
   onSelect(panel: ActivityPanel): void;
   onAccount(anchorY: number): void;
   onSettings(): void;
-  onSyncIcon(): void;
 }
 
 const items: Array<{ id: ActivityPanel; label: string; icon: string }> = [
@@ -24,7 +23,7 @@ const items: Array<{ id: ActivityPanel; label: string; icon: string }> = [
 export default function ActivityBar(props: ActivityBarProps) {
   const {
     activePanel, sidePanelOpen, changedFilesCount, syncState,
-    onSelect, onAccount, onSettings, onSyncIcon,
+    onSelect, onAccount, onSettings,
   } = props;
   const accountButtonRef: MutableRefObject<HTMLButtonElement | null> = useRef(null);
 
@@ -65,10 +64,10 @@ export default function ActivityBar(props: ActivityBarProps) {
           <Codicon name="extensions" size={24} />
         </button>
         <button
-          className="activity-bar__button"
+          className={`activity-bar__button ${activePanel === 'cloud' && sidePanelOpen ? 'is-active' : ''}`}
           type="button"
-          title={`Cloud Sync (${syncState})`}
-          onClick={onSyncIcon}
+          title={`Cloud Projects (${syncState})`}
+          onClick={() => onSelect('cloud')}
         >
           <Codicon
             name={syncState === 'error' ? 'cloud-offline' : syncState === 'syncing' ? 'sync' : 'cloud'}

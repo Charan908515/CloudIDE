@@ -1,5 +1,8 @@
 package com.cloudide.android.ui.screens.projects
 
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -23,6 +26,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Cloud
 import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Logout
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material3.AlertDialog
@@ -34,6 +38,7 @@ import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -73,13 +78,30 @@ fun ProjectsScreen(
 ) {
     val vm: ProjectsViewModel = viewModel(
         factory = viewModelFactory {
-            initializer { ProjectsViewModel(app.projectRepository) }
+            initializer { ProjectsViewModel(app.applicationContext, app.projectRepository) }
         }
     )
     val state by vm.state.collectAsState()
     val user by app.authManager.user.collectAsState()
     val scope = rememberCoroutineScope()
     var showCreate by remember { mutableStateOf(false) }
+    var pickedTreeUri by remember { mutableStateOf<Uri?>(null) }
+
+    val folderPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            // Persist read permission so subsequent reads (the import below) work.
+            try {
+                app.applicationContext.contentResolver.takePersistableUriPermission(
+                    uri,
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            } catch (_: Exception) { /* not strictly required for the immediate import */ }
+            pickedTreeUri = uri
+            showCreate = true
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -157,11 +179,31 @@ fun ProjectsScreen(
     if (showCreate) {
         CreateProjectDialog(
             isCreating = state.creating,
-            onDismiss = { if (!state.creating) showCreate = false },
-            onCreate = { name ->
-                vm.createProject(name) { project ->
+            progress = state.importProgress,
+            pickedTreeUri = pickedTreeUri,
+            onPickFolder = {
+                folderPicker.launch(null)
+            },
+            onClearFolder = { pickedTreeUri = null },
+            onDismiss = {
+                if (!state.creating) {
                     showCreate = false
-                    onProjectOpen(project)
+                    pickedTreeUri = null
+                }
+            },
+            onCreate = { name ->
+                val uri = pickedTreeUri
+                if (uri != null) {
+                    vm.createProjectFromDevice(name, uri) { project ->
+                        showCreate = false
+                        pickedTreeUri = null
+                        onProjectOpen(project)
+                    }
+                } else {
+                    vm.createProject(name) { project ->
+                        showCreate = false
+                        onProjectOpen(project)
+                    }
                 }
             },
         )
@@ -306,22 +348,123 @@ private fun CenteredSpinner() {
 @Composable
 private fun CreateProjectDialog(
     isCreating: Boolean,
+    progress: ImportProgressUi?,
+    pickedTreeUri: Uri?,
+    onPickFolder: () -> Unit,
+    onClearFolder: () -> Unit,
     onDismiss: () -> Unit,
     onCreate: (String) -> Unit,
 ) {
     var name by rememberSaveable { mutableStateOf("") }
+    val pickedFolderName = remember(pickedTreeUri) {
+        pickedTreeUri?.lastPathSegment
+            ?.substringAfterLast(':')
+            ?.substringAfterLast('/')
+            ?.takeIf { it.isNotEmpty() }
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(stringRes(R.string.new_project_dialog_title)) },
         text = {
-            OutlinedTextField(
-                value = name,
-                onValueChange = { name = it },
-                placeholder = { Text(stringRes(R.string.new_project_hint)) },
-                singleLine = true,
-                enabled = !isCreating,
-                shape = RoundedCornerShape(12.dp),
-            )
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    placeholder = { Text(stringRes(R.string.new_project_hint)) },
+                    singleLine = true,
+                    enabled = !isCreating,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(MaterialTheme.colorScheme.surface)
+                        .padding(12.dp),
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            text = "Source",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        if (pickedTreeUri == null) {
+                            Text(
+                                text = "Empty project — start with no files.",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            TextButton(
+                                onClick = onPickFolder,
+                                enabled = !isCreating,
+                                contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp),
+                            ) {
+                                Icon(Icons.Outlined.FolderOpen, contentDescription = null)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Or import a folder from this device")
+                            }
+                        } else {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    Icons.Outlined.FolderOpen,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        "Importing from device",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    Text(
+                                        pickedFolderName ?: "Folder selected",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        maxLines = 1,
+                                    )
+                                }
+                                if (!isCreating) {
+                                    TextButton(onClick = onClearFolder) { Text("Clear") }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (progress != null) {
+                    val pct = if (progress.total > 0) progress.current.toFloat() / progress.total else 0f
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            text = when (progress.phase) {
+                                "scan" -> "Preparing"
+                                "import" -> "Copying ${progress.current}/${progress.total}"
+                                "upload" -> "Uploading to Drive"
+                                else -> progress.phase
+                            },
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        if (progress.total > 0) {
+                            LinearProgressIndicator(
+                                progress = { pct.coerceIn(0f, 1f) },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        } else {
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        }
+                        if (progress.message.isNotBlank()) {
+                            Text(
+                                text = progress.message,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                            )
+                        }
+                    }
+                }
+            }
         },
         confirmButton = {
             TextButton(
@@ -332,10 +475,10 @@ private fun CreateProjectDialog(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
                         Spacer(Modifier.width(8.dp))
-                        Text("Creating…")
+                        Text(if (pickedTreeUri != null) "Importing…" else "Creating…")
                     }
                 } else {
-                    Text(stringRes(R.string.create))
+                    Text(if (pickedTreeUri != null) "Import" else stringRes(R.string.create))
                 }
             }
         },

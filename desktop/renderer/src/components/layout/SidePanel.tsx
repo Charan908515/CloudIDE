@@ -1,9 +1,10 @@
 import FileTree from '../explorer/FileTree';
 import SearchPanel from '../search/SearchPanel';
 import SourceControlPanel from '../git/SourceControlPanel';
+import CloudPanel from '../cloud/CloudPanel';
 
 interface SidePanelProps {
-  activePanel: 'files' | 'search' | 'git' | 'run' | 'extensions';
+  activePanel: 'files' | 'search' | 'git' | 'run' | 'extensions' | 'cloud';
 }
 
 const titles: Record<SidePanelProps['activePanel'], string> = {
@@ -12,6 +13,7 @@ const titles: Record<SidePanelProps['activePanel'], string> = {
   git: 'Source Control',
   run: 'Run and Debug',
   extensions: 'Extensions',
+  cloud: 'Cloud Projects',
 };
 
 export default function SidePanel({ activePanel }: SidePanelProps) {
@@ -24,6 +26,7 @@ export default function SidePanel({ activePanel }: SidePanelProps) {
         {activePanel === 'files' ? <FileTree /> : null}
         {activePanel === 'search' ? <SearchPanel /> : null}
         {activePanel === 'git' ? <SourceControlPanel /> : null}
+        {activePanel === 'cloud' ? <CloudPanel /> : null}
         {activePanel === 'run' ? (
           <div className="panel-placeholder">
             <p>Launch configurations and debugging tools will appear here.</p>
