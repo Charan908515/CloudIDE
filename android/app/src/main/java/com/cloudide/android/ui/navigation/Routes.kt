@@ -15,4 +15,8 @@ object Routes {
     const val FILE = "file/{folderId}/{relPath}/{name}"
     fun file(folderId: String, relPath: String, name: String): String =
         "file/${enc(folderId)}/${enc(relPath)}/${enc(name)}"
+
+    const val TERMINAL = "terminal/{folderId}"
+    const val TERMINAL_GLOBAL = "terminal/global"
+    fun terminal(folderId: String): String = "terminal/${enc(folderId)}"
 }

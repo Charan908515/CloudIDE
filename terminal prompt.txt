@@ -1,0 +1,91 @@
+in the android app i want a centralized terminal i mean it contains all the packages needed for all the projects.Instead of creating a node modules ,packages for each project we will create only one node modules,venv and when a new project is created then user will run npm install or pip install then simply add the new ones to the centralized ones.
+
+Implement a complete solution using a proot-based Linux environment (similar to Termux but embedded inside my app).
+
+Requirements:
+
+1. Architecture
+
+- Use a user-space Linux environment via proot (no root access required)
+- Support ARM64 devices (primary target)
+- Use Alpine Linux minirootfs (preferred for small size)
+
+2. Assets & Packaging
+
+- Store compressed root filesystem inside assets (rootfs.tar.xz)
+- Include a prebuilt proot binary for Android (arm64)
+- On first app launch:
+  - Extract rootfs to app internal storage: /data/data/<package>/files/rootfs
+  - Extract proot binary to /data/data/<package>/files/bin/
+  - Apply executable permissions
+
+3. Environment Setup
+
+- Configure environment variables:
+  - HOME
+  - PATH
+  - PREFIX (if needed)
+- Mount required directories using proot:
+  - /dev
+  - /proc
+  - /sys
+  - app project directory (bind mount)
+
+4. Shell Execution Engine
+
+- Implement a terminal execution system using ProcessBuilder or native execution
+- Allow running arbitrary shell commands inside proot environment
+- Support:
+  - Interactive shell sessions
+  - Running scripts (node, python)
+
+5. Install Toolchain Automatically
+   On first run inside proot:
+
+- Install Node.js and npm (apk add nodejs npm)
+- Install Python3 and pip (apk add python3 py3-pip)
+- Ensure commands available globally
+
+6. Integration with IDE
+
+- Expose API methods:
+  - runNodeScript(filePath)
+  - runPythonScript(filePath)
+  - runShellCommand(command)
+- Bind project folder from app storage into Linux environment
+
+7. Performance Optimizations
+
+- Use Alpine Linux for minimal size
+- Extract only once and reuse
+- Cache installed packages
+- Avoid reinstalling on every launch
+
+8. Error Handling
+
+- Detect extraction failures
+- Handle missing binaries
+- Provide logs for debugging
+
+9. Security
+
+- Ensure sandboxing within app storage
+- No root permissions required
+
+10. Deliverables
+    Provide:
+
+- Android (Kotlin/Java) implementation
+- File structure layout
+- Startup scripts
+- proot command examples
+- Extraction logic
+- Shell execution module
+
+11. Optional Enhancements
+
+- Terminal UI integration
+- Background process execution
+- Multi-session support
+
+

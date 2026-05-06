@@ -14,6 +14,7 @@ import com.cloudide.android.ui.screens.file.FileScreen
 import com.cloudide.android.ui.screens.login.LoginScreen
 import com.cloudide.android.ui.screens.project.ProjectScreen
 import com.cloudide.android.ui.screens.projects.ProjectsScreen
+import com.cloudide.android.ui.screens.terminal.TerminalScreen
 import java.net.URLDecoder
 
 private fun dec(s: String?) = URLDecoder.decode(s.orEmpty(), "UTF-8")
@@ -63,6 +64,9 @@ fun CloudIdeNavHost(app: CloudIdeApp) {
                 onFileOpen = { folderId, relPath, fileName ->
                     navController.navigate(Routes.file(folderId, relPath, fileName))
                 },
+                onTerminal = { folderId ->
+                    navController.navigate(Routes.terminal(folderId))
+                },
             )
         }
         composable(
@@ -78,6 +82,25 @@ fun CloudIdeNavHost(app: CloudIdeApp) {
                 projectFolderId = dec(backStackEntry.arguments?.getString("folderId")),
                 relativePath = dec(backStackEntry.arguments?.getString("relPath")),
                 fileName = dec(backStackEntry.arguments?.getString("name")),
+                onBack = { navController.popBackStack() },
+            )
+        }
+        composable(
+            route = Routes.TERMINAL,
+            arguments = listOf(
+                navArgument("folderId") { type = NavType.StringType },
+            )
+        ) { backStackEntry ->
+            TerminalScreen(
+                app = app,
+                projectFolderId = dec(backStackEntry.arguments?.getString("folderId")),
+                onBack = { navController.popBackStack() },
+            )
+        }
+        composable(Routes.TERMINAL_GLOBAL) {
+            TerminalScreen(
+                app = app,
+                projectFolderId = null,
                 onBack = { navController.popBackStack() },
             )
         }

@@ -29,6 +29,7 @@ import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Sync
+import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
@@ -73,6 +74,7 @@ fun ProjectScreen(
     projectName: String,
     onBack: () -> Unit,
     onFileOpen: (folderId: String, relativePath: String, fileName: String) -> Unit,
+    onTerminal: (folderId: String) -> Unit,
 ) {
     val context = LocalContext.current.applicationContext
     val vm: ProjectViewModel = viewModel(
@@ -126,6 +128,9 @@ fun ProjectScreen(
                     }
                     IconButton(onClick = vm::refresh) {
                         Icon(Icons.Outlined.Refresh, contentDescription = "Refresh")
+                    }
+                    IconButton(onClick = { onTerminal(projectFolderId) }) {
+                        Icon(Icons.Outlined.Terminal, contentDescription = "Terminal")
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
