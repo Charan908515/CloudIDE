@@ -204,15 +204,19 @@ class ProotEnvironment(internal val context: Context) {
      * FIX: alpineBase now uses ALPINE_VERSION (same version as the rootfs), so shared libraries
      * match the Node.js / Python binaries exactly.
      */
-    suspend fun installToolchains(): String =
+    suspend fun installToolchains(
+            onProgress: (suspend (String) -> Unit)? = null,
+    ): String =
             withContext(Dispatchers.IO) {
                 if (isToolchainReady) return@withContext "Toolchains already installed."
 
                 val sb = StringBuilder()
 
-                // ── FIX: use ALPINE_VERSION so packages match the rootfs ──
-                val alpineBase =
+                // ── Both main and community repos (npm, py3-pip live in community) ──
+                val mainBase =
                         "https://dl-cdn.alpinelinux.org/alpine/v$ALPINE_VERSION/main/$ALPINE_ARCH"
+                val communityBase =
+                        "https://dl-cdn.alpinelinux.org/alpine/v$ALPINE_VERSION/community/$ALPINE_ARCH"
 
                 // Alpine packages — order matters (dependencies before dependents)
                 val packages =
@@ -235,88 +239,120 @@ class ProotEnvironment(internal val context: Context) {
                                 "openssl",
                                 // SQLite (Node.js built-in addon)
                                 "sqlite-libs",
+                                // Node.js new deps (Alpine 3.21+)
+                                "libada",
+                                "simdjson",
+                                "simdutf",
                                 // Node.js
                                 "nodejs",
-                                "npm",
+                                "nodejs-npm",
                                 // Python deps
                                 "libffi",
                                 "gdbm",
                                 "xz-libs",
                                 "mpdecimal",
                                 "readline",
+                                "libpanelw",
                                 // Python
                                 "python3",
                                 "py3-pip",
+                                "py3-setuptools",
                         )
 
+                onProgress?.invoke("Fetching Alpine package index (main + community)…")
                 _setupState.value = SetupState.InProgress("Fetching package list…", 0.70f)
 
-                val indexUrl = "$alpineBase/APKINDEX.tar.gz"
-                val indexFile = File(baseDir, "APKINDEX.tar.gz")
-                val packageMap = mutableMapOf<String, String>() // name → filename
+                // packageName → Pair(filename, repoBaseUrl)
+                val packageMap = mutableMapOf<String, Pair<String, String>>()
 
-                try {
-                    downloadFile(indexUrl, indexFile)
-                    val indexDir = File(baseDir, "apkindex_tmp")
-                    indexDir.mkdirs()
-                    extractTarGz(indexFile, indexDir)
-                    val apkIndexFile = File(indexDir, "APKINDEX")
-                    if (apkIndexFile.exists()) {
-                        var currentName = ""
-                        var currentVersion = ""
-                        apkIndexFile.readLines().forEach { line ->
-                            when {
-                                line.startsWith("P:") -> currentName = line.substring(2)
-                                line.startsWith("V:") -> currentVersion = line.substring(2)
-                                line.isEmpty() -> {
-                                    if (currentName.isNotEmpty() && currentVersion.isNotEmpty()) {
-                                        packageMap[currentName] = "$currentName-$currentVersion.apk"
+                // Fetch APKINDEX from both repos
+                for ((repoName, repoUrl) in listOf("main" to mainBase, "community" to communityBase)) {
+                    val indexUrl = "$repoUrl/APKINDEX.tar.gz"
+                    val indexFile = File(baseDir, "APKINDEX_${repoName}.tar.gz")
+
+                    try {
+                        downloadFile(indexUrl, indexFile)
+                        val indexDir = File(baseDir, "apkindex_${repoName}_tmp")
+                        indexDir.mkdirs()
+                        extractTarGz(indexFile, indexDir)
+                        val apkIndexFile = File(indexDir, "APKINDEX")
+                        if (apkIndexFile.exists()) {
+                            var currentName = ""
+                            var currentVersion = ""
+                            apkIndexFile.readLines().forEach { line ->
+                                when {
+                                    line.startsWith("P:") -> currentName = line.substring(2)
+                                    line.startsWith("V:") -> currentVersion = line.substring(2)
+                                    line.isEmpty() -> {
+                                        if (currentName.isNotEmpty() && currentVersion.isNotEmpty()) {
+                                            // Don't overwrite if already in main
+                                            if (currentName !in packageMap) {
+                                                packageMap[currentName] =
+                                                        "$currentName-$currentVersion.apk" to repoUrl
+                                            }
+                                        }
+                                        currentName = ""
+                                        currentVersion = ""
                                     }
-                                    currentName = ""
-                                    currentVersion = ""
+                                }
+                            }
+                            // Handle last entry (file may not end with blank line)
+                            if (currentName.isNotEmpty() && currentVersion.isNotEmpty()) {
+                                if (currentName !in packageMap) {
+                                    packageMap[currentName] =
+                                            "$currentName-$currentVersion.apk" to repoUrl
                                 }
                             }
                         }
-                        // Handle last entry (file may not end with blank line)
-                        if (currentName.isNotEmpty() && currentVersion.isNotEmpty()) {
-                            packageMap[currentName] = "$currentName-$currentVersion.apk"
-                        }
+                        indexDir.deleteRecursively()
+                        onProgress?.invoke("✓ $repoName index loaded")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to fetch APKINDEX from $repoName", e)
+                        val msg = "✗ Failed to fetch $repoName index: ${e.message}"
+                        sb.appendLine(msg)
+                        onProgress?.invoke(msg)
+                    } finally {
+                        indexFile.delete()
                     }
-                    indexDir.deleteRecursively()
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to fetch APKINDEX", e)
-                    sb.appendLine("✗ Failed to fetch package index: ${e.message}")
-                } finally {
-                    indexFile.delete()
                 }
+
+                onProgress?.invoke("  ${packageMap.size} total packages available")
 
                 val totalPackages = packages.size
                 var installed = 0
 
                 for ((index, pkgName) in packages.withIndex()) {
-                    val filename = packageMap[pkgName]
-                    if (filename == null) {
-                        sb.appendLine("✗ $pkgName: not found in repository")
+                    val entry = packageMap[pkgName]
+                    if (entry == null) {
+                        val msg = "✗ $pkgName: not found in repository"
+                        sb.appendLine(msg)
+                        onProgress?.invoke(msg)
                         Log.w(TAG, "Package not found in APKINDEX: $pkgName")
                         continue
                     }
 
+                    val (filename, repoUrl) = entry
                     val progress = 0.72f + 0.25f * index / totalPackages
                     _setupState.value =
                             SetupState.InProgress(
                                     "Installing $pkgName… (${index + 1}/$totalPackages)",
                                     progress
                             )
+                    onProgress?.invoke("⏳ Installing $pkgName… (${index + 1}/$totalPackages)")
 
                     val pkgFile = File(baseDir, filename)
                     try {
-                        downloadFile("$alpineBase/$filename", pkgFile)
+                        downloadFile("$repoUrl/$filename", pkgFile)
                         extractTarGz(pkgFile, rootfsDir)
                         installed++
-                        sb.appendLine("✓ $pkgName installed")
+                        val msg = "✓ $pkgName installed"
+                        sb.appendLine(msg)
+                        onProgress?.invoke(msg)
                         Log.d(TAG, "Installed: $pkgName")
                     } catch (e: Exception) {
-                        sb.appendLine("✗ $pkgName failed: ${e.message}")
+                        val msg = "✗ $pkgName failed: ${e.message}"
+                        sb.appendLine(msg)
+                        onProgress?.invoke(msg)
                         Log.e(TAG, "Failed to install $pkgName", e)
                     } finally {
                         pkgFile.delete()
@@ -327,6 +363,12 @@ class ProotEnvironment(internal val context: Context) {
                 listOf("usr/bin", "usr/local/bin", "usr/sbin", "bin").forEach { binPath ->
                     File(rootfsDir, binPath).listFiles()?.forEach { it.setExecutable(true, false) }
                 }
+
+                // Create npm/pip symlinks if they don't exist
+                createBinSymlink("usr/bin/npm", "usr/bin/node")
+                createBinSymlink("usr/bin/pip3", "usr/bin/python3")
+                createBinSymlink("usr/bin/pip", "usr/bin/pip3")
+                createBinSymlink("usr/bin/python", "usr/bin/python3")
 
                 // Fix shared library symlinks that Alpine's .apk may have left broken
                 fixSharedLibSymlinks()
@@ -339,6 +381,24 @@ class ProotEnvironment(internal val context: Context) {
                 Log.d(TAG, "Toolchain install complete: $installed/$totalPackages")
                 sb.toString()
             }
+
+    /**
+     * Create a bin symlink by copying the target binary.
+     * Android proot can't always create real symlinks, so we copy instead.
+     */
+    private fun createBinSymlink(linkPath: String, targetPath: String) {
+        val link = File(rootfsDir, linkPath)
+        val target = File(rootfsDir, targetPath)
+        if (!link.exists() && target.exists()) {
+            try {
+                target.copyTo(link, overwrite = false)
+                link.setExecutable(true, false)
+                Log.d(TAG, "Created bin link: $linkPath → $targetPath")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to create bin link $linkPath: ${e.message}")
+            }
+        }
+    }
 
     /**
      * After extracting .apk files, many shared libraries exist as versioned files (e.g.
@@ -365,15 +425,27 @@ class ProotEnvironment(internal val context: Context) {
                         "libuv.so.1" to "libuv.so.1.",
                         "libicui18n.so" to "libicui18n.so.",
                         "libicuuc.so" to "libicuuc.so.",
+                        "libicudata.so" to "libicudata.so.",
                         "libnghttp2.so.14" to "libnghttp2.so.14.",
                         "libcares.so.2" to "libcares.so.2.",
                         "libbrotlidec.so.1" to "libbrotlidec.so.1.",
                         "libbrotlienc.so.1" to "libbrotlienc.so.1.",
+                        "libbrotlicommon.so.1" to "libbrotlicommon.so.1.",
                         "libzstd.so.1" to "libzstd.so.1.",
                         "libsqlite3.so.0" to "libsqlite3.so.0.",
                         "libffi.so.8" to "libffi.so.8.",
                         "libreadline.so.8" to "libreadline.so.8.",
                         "libpython3.so" to "libpython3.",
+                        // Node.js 22+ deps (Alpine 3.21)
+                        "libada.so.2" to "libada.so.2.",
+                        "libada.so" to "libada.so.",
+                        "libsimdjson.so.23" to "libsimdjson.so.23.",
+                        "libsimdjson.so" to "libsimdjson.so.",
+                        "libsimdutf.so.11" to "libsimdutf.so.11.",
+                        "libsimdutf.so" to "libsimdutf.so.",
+                        // ncurses (for Python's readline)
+                        "libncursesw.so.6" to "libncursesw.so.6.",
+                        "libpanelw.so.6" to "libpanelw.so.6.",
                 )
 
         for (dir in libDirs) {
@@ -930,6 +1002,15 @@ class ProotEnvironment(internal val context: Context) {
             }
         }
         Log.d(TAG, "Fixed $fixedCount busybox symlinks + musl linker")
+    }
+
+    /**
+     * Reset the toolchain-ready flag so that installToolchains() will run again.
+     * Use when the previous install was incomplete or packages were updated.
+     */
+    fun resetToolchainFlag() {
+        prefs.edit().putBoolean(KEY_TOOLCHAIN_READY, false).apply()
+        Log.d(TAG, "Toolchain ready flag reset")
     }
 
     /**

@@ -1,11 +1,14 @@
 package com.cloudide.android.data.terminal
 
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.InputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 data class TerminalCommandResult(
     val output: String = "",
@@ -15,24 +18,58 @@ data class TerminalCommandResult(
 )
 
 /**
- * A stable, app-native terminal session scoped to the CloudIDE workspace.
+ * A hybrid terminal session scoped to the CloudIDE workspace.
  *
- * This intentionally does not emulate a full Linux distro. It provides a small
- * command set for navigating and editing the current project safely on Android.
+ * File commands (ls, cd, cat, etc.) are handled natively for speed.
+ * Runtime commands (node, npm, python, pip, etc.) are delegated to the
+ * proot-based Alpine Linux environment.
  */
-class WorkspaceTerminalSession(rootDir: File) {
+class WorkspaceTerminalSession(
+    rootDir: File,
+    private val prootEnv: ProotEnvironment? = null,
+) {
+    companion object {
+        private const val TAG = "WkspTerminal"
+
+        /** Commands delegated to the proot Linux environment. */
+        private val PROOT_COMMANDS = setOf(
+            "node", "npm", "npx",
+            "python", "python3",
+            "pip", "pip3",
+            "git",
+            "apk",
+            "bash", "sh",
+            "curl", "wget",
+            "make", "gcc", "g++",
+        )
+    }
+
     private val rootDir = rootDir.canonicalFile.apply { mkdirs() }
     private var currentDir: File = this.rootDir
 
     var isAlive: Boolean = true
         private set
 
-    fun bannerLines(): List<String> = listOf(
-        "CloudIDE Workspace Terminal",
-        "Root: ${displayPath(rootDir)}",
-        "Commands: help, pwd, ls, cd, tree, find, cat, stat, mkdir, touch, cp, mv, rm, echo, clear, exit",
-        "Local Android shell only. node/npm/python/pip/git are not available here.",
-    )
+    /** Whether the proot toolchain (Node, Python) has been installed. */
+    val isToolchainReady: Boolean
+        get() = prootEnv?.isToolchainReady == true
+
+    fun bannerLines(): List<String> {
+        val runtimeStatus = if (prootEnv != null) {
+            if (prootEnv.isToolchainReady)
+                "✓ node/npm/python/pip available (Alpine Linux)"
+            else
+                "⚠ Toolchains not installed. Run `setup-toolchains` to install Node.js & Python."
+        } else {
+            "⚠ Proot environment not available. Runtime commands disabled."
+        }
+        return listOf(
+            "CloudIDE Terminal",
+            "Root: ${displayPath(rootDir)}",
+            "File commands: help, pwd, ls, cd, tree, find, cat, stat, mkdir, touch, cp, mv, rm, echo, clear, exit",
+            runtimeStatus,
+        )
+    }
 
     suspend fun execute(rawCommand: String): TerminalCommandResult = withContext(Dispatchers.IO) {
         if (!isAlive) {
@@ -46,33 +83,38 @@ class WorkspaceTerminalSession(rootDir: File) {
         }
 
         try {
-            when (parsed.args.first().lowercase(Locale.ROOT)) {
-                "help" -> helpResult()
-                "pwd" -> TerminalCommandResult(output = displayPath(currentDir))
-                "ls" -> lsResult(parsed.args.drop(1))
-                "cd" -> cdResult(parsed.args.drop(1))
-                "tree" -> treeResult(parsed.args.drop(1))
-                "find" -> findResult(parsed.args.drop(1))
-                "cat" -> catResult(parsed.args.drop(1))
-                "stat" -> statResult(parsed.args.drop(1))
-                "mkdir" -> mkdirResult(parsed.args.drop(1))
-                "touch" -> touchResult(parsed.args.drop(1))
-                "cp" -> copyResult(parsed.args.drop(1))
-                "mv" -> moveResult(parsed.args.drop(1))
-                "rm" -> removeResult(parsed.args.drop(1))
-                "echo" -> echoResult(parsed)
-                "clear" -> TerminalCommandResult(clearScreen = true)
-                "exit", "quit" -> {
+            val cmd = parsed.args.first().lowercase(Locale.ROOT)
+            when {
+                cmd == "help" -> helpResult()
+                cmd == "pwd" -> TerminalCommandResult(output = displayPath(currentDir))
+                cmd == "ls" -> lsResult(parsed.args.drop(1))
+                cmd == "cd" -> cdResult(parsed.args.drop(1))
+                cmd == "tree" -> treeResult(parsed.args.drop(1))
+                cmd == "find" -> findResult(parsed.args.drop(1))
+                cmd == "cat" -> catResult(parsed.args.drop(1))
+                cmd == "stat" -> statResult(parsed.args.drop(1))
+                cmd == "mkdir" -> mkdirResult(parsed.args.drop(1))
+                cmd == "touch" -> touchResult(parsed.args.drop(1))
+                cmd == "cp" -> copyResult(parsed.args.drop(1))
+                cmd == "mv" -> moveResult(parsed.args.drop(1))
+                cmd == "rm" -> removeResult(parsed.args.drop(1))
+                cmd == "echo" -> echoResult(parsed)
+                cmd == "clear" -> TerminalCommandResult(clearScreen = true)
+                cmd == "exit" || cmd == "quit" -> {
                     isAlive = false
                     TerminalCommandResult(output = "Session closed.", closeSession = true)
                 }
-                "node", "npm", "npx", "python", "python3", "pip", "pip3", "git",
-                "apk", "proot", "bash", "sh" -> unsupportedRuntimeResult(parsed.args.first())
+                cmd == "setup-toolchains" -> TerminalCommandResult(
+                    output = "Toolchain setup is handled at the terminal level. Please use the terminal UI."
+                )
+                // ── Proot-delegated runtime commands ──
+                cmd in PROOT_COMMANDS -> executeInProot(rawCommand)
                 else -> TerminalCommandResult(
                     error = "Unknown command: ${parsed.args.first()}. Run `help` for supported commands."
                 )
             }
         } catch (e: Exception) {
+            Log.e(TAG, "Command failed: $rawCommand", e)
             TerminalCommandResult(error = e.message ?: "Command failed.")
         }
     }
@@ -81,27 +123,46 @@ class WorkspaceTerminalSession(rootDir: File) {
         isAlive = false
     }
 
-    private fun helpResult(): TerminalCommandResult = TerminalCommandResult(
-        output = """
-            CloudIDE workspace commands
-            help               Show this message
-            pwd                Show current directory
-            ls [-a] [path]     List files
-            cd [path]          Change directory inside the project
-            tree [path]        Show a recursive file tree
-            find <name> [dir]  Find files or folders by name
-            cat <file>         Print a text file
-            stat <path>        Show file details
-            mkdir <path>       Create a directory
-            touch <path>       Create an empty file
-            cp <src> <dest>    Copy a file or directory
-            mv <src> <dest>    Move or rename a file or directory
-            rm [-r] <path>     Remove a file or directory
-            echo ... [> file]  Print text or write it to a file
-            clear              Clear the terminal output
-            exit               Close the current session
-        """.trimIndent()
-    )
+    private fun helpResult(): TerminalCommandResult {
+        val runtimeHelp = if (prootEnv != null) {
+            """
+
+                ── Runtime commands (via Alpine Linux proot) ──
+                node <file.js>         Run a Node.js script
+                npm install <pkg>      Install an npm package
+                npm init               Initialize a new Node project
+                npx <command>          Run an npx command
+                python3 <file.py>      Run a Python script
+                pip3 install <pkg>     Install a Python package
+                git <command>          Run git commands
+                setup-toolchains       Install/reinstall Node.js & Python
+            """.trimIndent()
+        } else ""
+
+        return TerminalCommandResult(
+            output = """
+                CloudIDE Terminal commands
+
+                ── File commands (fast, local) ──
+                help               Show this message
+                pwd                Show current directory
+                ls [-a] [path]     List files
+                cd [path]          Change directory inside the project
+                tree [path]        Show a recursive file tree
+                find <name> [dir]  Find files or folders by name
+                cat <file>         Print a text file
+                stat <path>        Show file details
+                mkdir <path>       Create a directory
+                touch <path>       Create an empty file
+                cp <src> <dest>    Copy a file or directory
+                mv <src> <dest>    Move or rename a file or directory
+                rm [-r] <path>     Remove a file or directory
+                echo ... [> file]  Print text or write it to a file
+                clear              Clear the terminal output
+                exit               Close the current session
+            """.trimIndent() + runtimeHelp
+        )
+    }
 
     private fun lsResult(args: List<String>): TerminalCommandResult {
         val showHidden = args.contains("-a")
@@ -301,10 +362,153 @@ class WorkspaceTerminalSession(rootDir: File) {
         return TerminalCommandResult()
     }
 
-    private fun unsupportedRuntimeResult(command: String): TerminalCommandResult = TerminalCommandResult(
-        error = "`$command` is not available in the Android workspace terminal. " +
-            "This terminal manages project files only. Use the desktop app or add a remote runner for Node/Python."
-    )
+    // ───────── Proot integration ─────────
+
+    /**
+     * Execute a command inside the proot Alpine Linux environment.
+     * Binds the current project directory so files are accessible at /home/project.
+     */
+    private suspend fun executeInProot(command: String): TerminalCommandResult =
+        withContext(Dispatchers.IO) {
+            val env = prootEnv
+                ?: return@withContext TerminalCommandResult(
+                    error = "Proot environment not available. Runtime commands are disabled."
+                )
+
+            if (!env.isInitialized) {
+                return@withContext TerminalCommandResult(
+                    error = "Linux environment not initialized. Please wait for setup to complete."
+                )
+            }
+
+            if (!env.isToolchainReady) {
+                return@withContext TerminalCommandResult(
+                    error = "Toolchains not installed yet. Run `setup-toolchains` first."
+                )
+            }
+
+            try {
+                val proCmd = env.buildProotCommand(command, rootDir)
+                Log.d(TAG, "Proot exec: ${proCmd.joinToString(" ")}")
+
+                val pb = ProcessBuilder(proCmd)
+                pb.redirectErrorStream(true)
+                configureProotEnvironment(pb, env)
+
+                val proc = pb.start()
+                val output = readProcessOutput(proc.inputStream, maxChars = 50_000)
+                val finished = proc.waitFor(120, TimeUnit.SECONDS)
+                if (!finished) {
+                    proc.destroyForcibly()
+                    return@withContext TerminalCommandResult(
+                        output = output + "\n[Command timed out after 120s]"
+                    )
+                }
+
+                val exitCode = proc.exitValue()
+                val result = if (exitCode != 0 && output.isBlank()) {
+                    "Process exited with code $exitCode"
+                } else {
+                    output
+                }
+
+                TerminalCommandResult(output = result.ifBlank { "(no output)" })
+            } catch (e: Exception) {
+                Log.e(TAG, "Proot execution failed", e)
+                TerminalCommandResult(error = "Execution failed: ${e.message}")
+            }
+        }
+
+    /**
+     * Install Node.js and Python toolchains into the proot environment.
+     */
+    private suspend fun installToolchainsResult(): TerminalCommandResult =
+        withContext(Dispatchers.IO) {
+            val env = prootEnv
+                ?: return@withContext TerminalCommandResult(
+                    error = "Proot environment not available."
+                )
+
+            if (!env.isInitialized) {
+                return@withContext TerminalCommandResult(
+                    error = "Linux environment not initialized. Please wait for setup to complete."
+                )
+            }
+
+            if (env.isToolchainReady) {
+                return@withContext TerminalCommandResult(
+                    output = "Toolchains already installed.\n" +
+                        "  node: available\n" +
+                        "  npm:  available\n" +
+                        "  python3: available\n" +
+                        "  pip3: available\n" +
+                        "\nRun `node --version` or `python3 --version` to verify."
+                )
+            }
+
+            try {
+                val result = env.installToolchains()
+                TerminalCommandResult(
+                    output = result + "\n\n" +
+                        "Toolchains installed! You can now use:\n" +
+                        "  node <file.js>        Run JavaScript files\n" +
+                        "  npm install <pkg>     Install npm packages\n" +
+                        "  python3 <file.py>     Run Python files\n" +
+                        "  pip3 install <pkg>    Install Python packages"
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Toolchain installation failed", e)
+                TerminalCommandResult(error = "Toolchain installation failed: ${e.message}")
+            }
+        }
+
+    /**
+     * Configure environment variables for the proot process.
+     */
+    private fun configureProotEnvironment(pb: ProcessBuilder, env: ProotEnvironment) {
+        val nativeDir = env.context.applicationInfo.nativeLibraryDir
+
+        pb.environment()["PROOT_TMP_DIR"] = env.tmpDir.absolutePath
+        pb.environment()["LD_LIBRARY_PATH"] = env.libDir.absolutePath
+
+        val loader = File(nativeDir, "libproot-loader.so")
+        val loader32 = File(nativeDir, "libproot-loader32.so")
+        if (loader.exists()) pb.environment()["PROOT_LOADER"] = loader.absolutePath
+        if (loader32.exists()) pb.environment()["PROOT_LOADER_32"] = loader32.absolutePath
+
+        pb.environment()["PROOT_NO_SECCOMP"] = "1"
+
+        pb.environment()["HOME"] = "/root"
+        pb.environment()["TERM"] = "xterm-256color"
+        pb.environment()["LANG"] = "C.UTF-8"
+        pb.environment()["SHELL"] = "/bin/sh"
+        pb.environment()["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        pb.environment()["LD_LIBRARY_PATH"] =
+            "/usr/lib:/lib:/usr/local/lib:${env.libDir.absolutePath}"
+        pb.environment()["NODE_PATH"] = "/opt/packages/node_modules"
+        pb.environment()["PYTHONPATH"] = "/opt/packages/python_packages"
+        pb.environment()["npm_config_prefix"] = "/opt/packages"
+    }
+
+    /**
+     * Read process output with a character limit to prevent OOM on huge outputs.
+     */
+    private fun readProcessOutput(input: InputStream, maxChars: Int): String {
+        val sb = StringBuilder()
+        val reader = input.bufferedReader()
+        val buffer = CharArray(4096)
+        var totalRead = 0
+        while (totalRead < maxChars) {
+            val n = reader.read(buffer, 0, minOf(buffer.size, maxChars - totalRead))
+            if (n <= 0) break
+            sb.append(buffer, 0, n)
+            totalRead += n
+        }
+        if (totalRead >= maxChars) {
+            sb.append("\n[Output truncated at ${maxChars} characters]")
+        }
+        return sb.toString()
+    }
 
     private fun resolve(input: String): File {
         val normalized = input.replace('\\', '/')

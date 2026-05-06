@@ -3,12 +3,15 @@ package com.cloudide.android.ui.screens.terminal
 import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.cloudide.android.data.terminal.ProotEnvironment
 import com.cloudide.android.data.terminal.WorkspaceTerminalSession
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 data class TerminalUiState(
@@ -30,6 +33,7 @@ class TerminalViewModel(
     projectDir: File?,
 ) : ViewModel() {
     private val terminalRoot: File = projectDir ?: File(appContext.filesDir, "projects").apply { mkdirs() }
+    private val prootEnv = ProotEnvironment(appContext)
     private var session: WorkspaceTerminalSession? = null
 
     private val _state = MutableStateFlow(TerminalUiState())
@@ -37,26 +41,60 @@ class TerminalViewModel(
 
     /**
      * Start a workspace-scoped terminal session.
+     * Also initializes the proot Linux environment in the background.
      */
     fun initializeAndStart() {
         if (session?.isAlive == true) {
             return
         }
-        appendSystem("Starting workspace terminal…")
+        appendSystem("Starting terminal…")
         startShell()
+        initializeProotInBackground()
     }
 
     /**
-     * Start a fresh workspace terminal session.
+     * Initialize proot environment in the background so it's ready when
+     * the user runs runtime commands.
+     */
+    private fun initializeProotInBackground() {
+        viewModelScope.launch {
+            try {
+                if (!prootEnv.isInitialized) {
+                    appendSystem("⏳ Setting up Linux environment (first time only)…")
+                }
+                prootEnv.initialize()
+                when (val state = prootEnv.setupState.value) {
+                    is ProotEnvironment.SetupState.Ready -> {
+                        if (prootEnv.isToolchainReady) {
+                            appendSystem("✓ Linux environment ready — node/npm/python/pip available")
+                        } else {
+                            appendSystem("✓ Linux environment ready — run `setup-toolchains` to install Node.js & Python")
+                        }
+                    }
+                    is ProotEnvironment.SetupState.Failed -> {
+                        appendError("✗ Linux setup failed: ${state.error}")
+                    }
+                    else -> { /* InProgress / NotStarted — handled by state flow */ }
+                }
+            } catch (e: Exception) {
+                appendError("✗ Linux environment init failed: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * Start a fresh workspace terminal session with proot integration.
      */
     private fun startShell() {
         session?.destroy()
-        val newSession = WorkspaceTerminalSession(terminalRoot)
+        val newSession = WorkspaceTerminalSession(terminalRoot, prootEnv)
         session = newSession
 
-        _state.update { it.copy(sessionAlive = true, statusText = "Workspace shell active") }
+        _state.update { it.copy(sessionAlive = true, statusText = "Terminal active") }
         newSession.bannerLines().forEach(::appendSystem)
     }
+
+    private var isInstallingToolchains = false
 
     /**
      * Execute a user command in the workspace terminal.
@@ -67,9 +105,24 @@ class TerminalViewModel(
             appendError("No active session. Tap 'Start' to begin.")
             return
         }
-        appendInput(command)
+
+        val trimmed = command.trim()
+        appendInput(trimmed)
+
+        // ── Special handling: setup/reset-toolchains runs in background with streaming progress ──
+        if (trimmed.equals("setup-toolchains", ignoreCase = true)) {
+            runToolchainInstall()
+            return
+        }
+        if (trimmed.equals("reset-toolchains", ignoreCase = true)) {
+            appendSystem("Resetting toolchain flag and re-installing…")
+            prootEnv.resetToolchainFlag()
+            runToolchainInstall()
+            return
+        }
+
         viewModelScope.launch {
-            val result = s.execute(command)
+            val result = s.execute(trimmed)
             if (result.clearScreen) {
                 _state.update { it.copy(lines = emptyList()) }
             }
@@ -86,11 +139,69 @@ class TerminalViewModel(
     }
 
     /**
+     * Run toolchain installation in the background, streaming progress to the terminal.
+     */
+    private fun runToolchainInstall() {
+        if (isInstallingToolchains) {
+            appendError("Toolchain installation is already in progress. Please wait.")
+            return
+        }
+
+        if (!prootEnv.isInitialized) {
+            appendError("Linux environment not initialized. Please wait for setup to complete.")
+            return
+        }
+
+        if (prootEnv.isToolchainReady) {
+            appendSystem("Toolchains already installed.")
+            appendOutput(
+                "  node: available\n" +
+                "  npm:  available\n" +
+                "  python3: available\n" +
+                "  pip3: available\n" +
+                "\nRun `node --version` or `python3 --version` to verify."
+            )
+            return
+        }
+
+        isInstallingToolchains = true
+        _state.update { it.copy(statusText = "Installing toolchains…") }
+        appendSystem("⏳ Installing Node.js & Python toolchains — this may take a few minutes…")
+
+        viewModelScope.launch {
+            try {
+                val result = prootEnv.installToolchains { progressLine ->
+                    // Stream each progress line to the terminal in real-time
+                    withContext(Dispatchers.Main) {
+                        appendOutput(progressLine)
+                    }
+                }
+
+                appendSystem("─────────────────────────")
+                appendSystem(
+                    "✓ Toolchains installed! You can now use:\n" +
+                    "  node <file.js>        Run JavaScript files\n" +
+                    "  npm install <pkg>     Install npm packages\n" +
+                    "  python3 <file.py>     Run Python files\n" +
+                    "  pip3 install <pkg>    Install Python packages"
+                )
+                _state.update { it.copy(statusText = "Terminal active") }
+            } catch (e: Exception) {
+                appendError("✗ Toolchain installation failed: ${e.message}")
+                _state.update { it.copy(statusText = "Terminal active") }
+            } finally {
+                isInstallingToolchains = false
+            }
+        }
+    }
+
+    /**
      * Restart the shell session.
      */
     fun restart() {
-        appendSystem("Restarting workspace terminal…")
+        appendSystem("Restarting terminal…")
         startShell()
+        initializeProotInBackground()
     }
 
     /**

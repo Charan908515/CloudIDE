@@ -198,16 +198,18 @@ private fun WelcomeMessage() {
         )
         Spacer(Modifier.height(4.dp))
         Text(
-            "Android workspace shell",
+            "Hybrid terminal — local files + Linux runtime",
             color = Color(0xFF6C7086),
             fontFamily = FontFamily.Monospace,
             fontSize = 12.sp,
         )
         Spacer(Modifier.height(8.dp))
         Text(
-            "• Stable on-device file commands for your project\n" +
-            "• Use help to see supported commands\n" +
-            "• node, npm, python, pip, and git are not available in this local shell",
+            "• File commands: ls, cd, cat, mkdir, rm, etc. (fast, local)\n" +
+            "• Runtime commands: node, npm, python3, pip3 (via Alpine Linux)\n" +
+            "• Run `setup-toolchains` to install Node.js & Python\n" +
+            "• Run `reset-toolchains` to force re-install if incomplete\n" +
+            "• Run `help` for the full command list",
             color = Color(0xFFA6ADC8),
             fontFamily = FontFamily.Monospace,
             fontSize = 12.sp,
