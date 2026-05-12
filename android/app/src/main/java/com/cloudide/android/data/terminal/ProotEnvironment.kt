@@ -7,64 +7,84 @@ import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.nio.file.Files
+import java.nio.file.Paths
 import java.util.zip.GZIPInputStream
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import org.tukaani.xz.XZInputStream
 
 /**
- * Manages a proot-based Alpine Linux environment.
+ * Termux-style proot environment for Ubuntu.
  *
- * Directory layout (inside app's filesDir): files/
- * ```
- *     proot/
- *       bin/proot          ← proot binary
- *       rootfs/            ← Alpine minirootfs
- *         bin/ etc/ usr/ ...
- *       packages/          ← centralized node_modules, venv, etc.
- *         node_modules/
- *         python_packages/
- *       tmp/               ← scratch area
- * ```
+ * Mirrors `proot-distro install ubuntu` + `proot-distro login ubuntu`:
+ * 1. Download Termux's official Ubuntu rootfs tarball.
+ * 2. Extract it, point /etc/resolv.conf at public DNS, write apt sources.
+ * 3. Run proot with the same bind mounts and flags Termux uses.
  */
 class ProotEnvironment(internal val context: Context) {
 
     companion object {
         private const val TAG = "ProotEnv"
+        const val UBUNTU_VERSION = "25.10"
 
-        // ── FIX: Both version constants must be consistent ──
-        private const val ALPINE_VERSION = "3.21" // used for package repo URL
-        private const val ALPINE_PATCH = "3.21.3" // used for rootfs tarball
-        private const val ALPINE_ARCH = "aarch64"
-        private const val ALPINE_URL =
-                "https://dl-cdn.alpinelinux.org/alpine/v$ALPINE_VERSION/releases/$ALPINE_ARCH/alpine-minirootfs-$ALPINE_PATCH-$ALPINE_ARCH.tar.gz"
+        private const val UBUNTU_ROOTFS_URL =
+                "https://easycli.sh/proot-distro/ubuntu-questing-aarch64-pd-v4.37.0.tar.xz"
+        private const val UBUNTU_ROOTFS_URL_FALLBACK =
+                "https://github.com/termux/proot-distro/releases/download/v4.37.0/ubuntu-questing-aarch64-pd-v4.37.0.tar.xz"
 
+        private const val UBUNTU_CODENAME = "questing"
+
+        // ── Pre-built static binaries (we skip apt/dpkg entirely) ──────────
+        // python-build-standalone: standalone glibc Python with bundled pip.
+        // nodejs.org: official aarch64 Linux binaries with bundled npm.
+        // Both are self-contained and don't need apt/dpkg to install.
+        private const val PYTHON_URL =
+                "https://github.com/astral-sh/python-build-standalone/releases/download/20251028/cpython-3.14.0+20251028-aarch64-unknown-linux-gnu-install_only.tar.gz"
+        private const val NODE_VERSION = "22.16.0"
+        private const val NODE_URL =
+                "https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-linux-arm64.tar.xz"
+        private const val WORKSPACE_MOUNT_PATH = "/workspace"
         private const val PREFS_NAME = "proot_env"
         private const val KEY_INITIALIZED = "initialized"
-        private const val KEY_TOOLCHAIN_READY = "toolchain_ready"
+        private const val KEY_ENV_VERSION = "env_version"
+
+        // v133 — two-bug fix:
+        //   1. npm broken: resolveNodeModuleSymlinks was deleting symlinks
+        //      then calling renameTo() which could silently fail, leaving
+        //      files (e.g. isexe/dist/cjs/index.js) permanently gone.
+        //      Fixed by using Files.move(REPLACE_EXISTING) instead.
+        //      NODE_SCHEMA_VERSION bumped → Node re-extracted with clean files.
+        //   2. `import langchain` OSError(38): sitecustomize.py only patched
+        //      os.getcwd (Python level), not posix.getcwd (C level) which is
+        //      what importlib._bootstrap_external._os.getcwd() actually calls.
+        //      Fixed by also patching posix.getcwd in sitecustomize.py.
+        private const val CURRENT_ENV_VERSION = 133
+
+        // Bump PYTHON_SCHEMA_VERSION to force Python re-extract.
+        // Bump NODE_SCHEMA_VERSION to force Node re-extract (fixes missing isexe).
+        private const val PYTHON_SCHEMA_VERSION = 3 // unchanged — Python is fine
+        private const val NODE_SCHEMA_VERSION = 4 // bumped — re-extract Node
     }
 
-    // Directories
     val baseDir: File
         get() = File(context.filesDir, "proot")
     val rootfsDir: File
         get() = File(baseDir, "rootfs")
-    val binDir: File
-        get() = File(baseDir, "bin")
     val libDir: File
         get() = File(baseDir, "lib")
-    val prootBinary: File
-        get() = File(context.applicationInfo.nativeLibraryDir, "libproot.so")
-    val packagesDir: File
-        get() = File(baseDir, "packages")
-    val nodeModulesDir: File
-        get() = File(packagesDir, "node_modules")
-    val pythonPackagesDir: File
-        get() = File(packagesDir, "python_packages")
     val tmpDir: File
         get() = File(baseDir, "tmp")
+    val prootBinary: File
+        get() = File(context.applicationInfo.nativeLibraryDir, "libproot.so")
 
     sealed class SetupState {
         data object NotStarted : SetupState()
@@ -73,534 +93,1102 @@ class ProotEnvironment(internal val context: Context) {
         data class Failed(val error: String) : SetupState()
     }
 
+    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val setupMutex = Mutex()
+    private var initJob: Job? = null
+
     private val _setupState = MutableStateFlow<SetupState>(SetupState.NotStarted)
     val setupState: StateFlow<SetupState> = _setupState.asStateFlow()
 
-    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val _setupLogs = MutableStateFlow<List<String>>(emptyList())
+    val setupLogs: StateFlow<List<String>> = _setupLogs.asStateFlow()
 
     val isInitialized: Boolean
-        get() = prefs.getBoolean(KEY_INITIALIZED, false)
-    val isToolchainReady: Boolean
-        get() = prefs.getBoolean(KEY_TOOLCHAIN_READY, false)
+        get() =
+                prefs.getBoolean(KEY_INITIALIZED, false) &&
+                        prefs.getInt(KEY_ENV_VERSION, 0) >= CURRENT_ENV_VERSION &&
+                        File(rootfsDir, "bin/bash").exists()
 
-    /**
-     * Full first-time setup: download proot, extract Alpine rootfs, install toolchains. Idempotent
-     * — skips already-completed steps.
-     */
+    fun ensureInitializedInBackground(scope: CoroutineScope) {
+        if (isInitialized) {
+            _setupState.value = SetupState.Ready
+            return
+        }
+        if (initJob?.isActive == true) return
+        initJob = scope.launch { initialize() }
+    }
+
     suspend fun initialize() =
             withContext(Dispatchers.IO) {
-                val tallocReady = File(libDir, "libtalloc.so.2").exists()
-                val muslReady =
-                        File(rootfsDir, "lib/ld-musl-aarch64.so.1").let {
-                            it.exists() && it.length() > 0
+                setupMutex.withLock {
+                    if (isInitialized) {
+                        _setupState.value = SetupState.Ready
+                        return@withLock
+                    }
+
+                    _setupLogs.value = emptyList()
+
+                    try {
+                        progress("Preparing environment…", 0.05f)
+                        baseDir.mkdirs()
+                        rootfsDir.mkdirs()
+                        libDir.mkdirs()
+                        tmpDir.mkdirs()
+
+                        if (!prootBinary.exists()) {
+                            fail("libproot.so missing. Set android:extractNativeLibs=\"true\".")
+                            return@withLock
                         }
-                val shReady = File(rootfsDir, "bin/sh").let { it.exists() && it.length() > 0 }
 
-                if (isInitialized &&
-                                prootBinary.exists() &&
-                                prootBinary.canExecute() &&
-                                tallocReady &&
-                                muslReady &&
-                                shReady
-                ) {
-                    _setupState.value = SetupState.Ready
-                    return@withContext
-                }
+                        val tallocLib = File(libDir, "libtalloc.so.2")
+                        if (!tallocLib.exists()) extractAsset("libtalloc.so.2", tallocLib)
 
-                try {
-                    _setupState.value = SetupState.InProgress("Creating directories…", 0.05f)
-                    ensureDirectories()
-
-                    if (!prootBinary.exists()) {
-                        _setupState.value =
-                                SetupState.Failed(
-                                        "proot binary not found at ${prootBinary.absolutePath}. Reinstall the app."
+                        // Copy renameat2 fix shim (built by NDK) into lib dir
+                        val renameat2Src =
+                                File(
+                                        context.applicationInfo.nativeLibraryDir,
+                                        "librenameat2-fix.so"
                                 )
-                        return@withContext
-                    }
-                    Log.d(
-                            TAG,
-                            "proot binary found: ${prootBinary.absolutePath} (${prootBinary.length()} bytes)"
-                    )
-
-                    _setupState.value = SetupState.InProgress("Extracting libraries…", 0.12f)
-                    libDir.mkdirs()
-
-                    // libtalloc.so.2 — bundled in assets/
-                    val tallocLib = File(libDir, "libtalloc.so.2")
-                    if (!tallocLib.exists() || tallocLib.length() < 1000) {
-                        try {
-                            extractAsset("libtalloc.so.2", tallocLib)
-                            Log.d(TAG, "libtalloc.so.2 extracted: ${tallocLib.length()} bytes")
-                        } catch (e: Exception) {
-                            Log.w(TAG, "libtalloc.so.2 extraction failed: ${e.message}")
+                        val renameat2Dst = File(libDir, "librenameat2-fix.so")
+                        if (renameat2Src.exists() && !renameat2Dst.exists()) {
+                            renameat2Src.copyTo(renameat2Dst, overwrite = false)
+                            renameat2Dst.setReadable(true, false)
                         }
-                    }
 
-                    // proot loader binaries — in jniLibs, auto-extracted by Android with execute
-                    // perm
-                    val nativeDir = context.applicationInfo.nativeLibraryDir
-                    val loader = File(nativeDir, "libproot-loader.so")
-                    val loader32 = File(nativeDir, "libproot-loader32.so")
-                    Log.d(
-                            TAG,
-                            "proot-loader:   exists=${loader.exists()},   exec=${loader.canExecute()}"
-                    )
-                    Log.d(
-                            TAG,
-                            "proot-loader32: exists=${loader32.exists()}, path=${loader32.absolutePath}"
-                    )
-
-                    // Download & extract Alpine rootfs
-                    val etcDir = File(rootfsDir, "etc")
-                    if (!etcDir.exists()) {
-                        _setupState.value = SetupState.InProgress("Downloading Alpine Linux…", 0.2f)
-                        val tarball = File(baseDir, "alpine.tar.gz")
-                        try {
-                            downloadFile(ALPINE_URL, tarball)
-                        } catch (e: Exception) {
-                            tarball.delete()
-                            _setupState.value =
-                                    SetupState.Failed(
-                                            "Failed to download Alpine rootfs: ${e.message}"
-                                    )
-                            return@withContext
-                        }
-                        _setupState.value = SetupState.InProgress("Extracting rootfs…", 0.5f)
-                        try {
-                            extractTarGz(tarball, rootfsDir)
-                        } catch (e: Exception) {
-                            rootfsDir.deleteRecursively()
-                            rootfsDir.mkdirs()
-                            _setupState.value =
-                                    SetupState.Failed("Failed to extract rootfs: ${e.message}")
-                            return@withContext
-                        } finally {
-                            tarball.delete()
-                        }
-                        Log.d(TAG, "rootfs extracted")
-                    }
-
-                    _setupState.value = SetupState.InProgress("Configuring environment…", 0.7f)
-                    fixBusyboxSymlinks()
-                    configureRootfs()
-
-                    nodeModulesDir.mkdirs()
-                    pythonPackagesDir.mkdirs()
-
-                    prefs.edit().putBoolean(KEY_INITIALIZED, true).apply()
-                    _setupState.value = SetupState.Ready
-                    Log.d(TAG, "Environment initialized")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Setup failed", e)
-                    _setupState.value =
-                            SetupState.Failed("Setup failed: ${e.message ?: "Unknown error"}")
-                }
-            }
-
-    /**
-     * Install toolchains by downloading Alpine's native .apk packages.
-     *
-     * FIX: alpineBase now uses ALPINE_VERSION (same version as the rootfs), so shared libraries
-     * match the Node.js / Python binaries exactly.
-     */
-    suspend fun installToolchains(
-            onProgress: (suspend (String) -> Unit)? = null,
-    ): String =
-            withContext(Dispatchers.IO) {
-                if (isToolchainReady) return@withContext "Toolchains already installed."
-
-                val sb = StringBuilder()
-
-                // ── Both main and community repos (npm, py3-pip live in community) ──
-                val mainBase =
-                        "https://dl-cdn.alpinelinux.org/alpine/v$ALPINE_VERSION/main/$ALPINE_ARCH"
-                val communityBase =
-                        "https://dl-cdn.alpinelinux.org/alpine/v$ALPINE_VERSION/community/$ALPINE_ARCH"
-
-                // Alpine packages — order matters (dependencies before dependents)
-                val packages =
-                        listOf(
-                                // C++ / runtime deps (Node.js needs these)
-                                "libgcc",
-                                "libstdc++",
-                                // Compression
-                                "zlib",
-                                "brotli-libs",
-                                "zstd-libs",
-                                // Network
-                                "c-ares",
-                                "nghttp2-libs",
-                                // Unicode / ICU
-                                "icu-libs",
-                                // Async I/O (Node.js)
-                                "libuv",
-                                // SSL / crypto
-                                "openssl",
-                                // SQLite (Node.js built-in addon)
-                                "sqlite-libs",
-                                // Node.js new deps (Alpine 3.21+)
-                                "libada",
-                                "simdjson",
-                                "simdutf",
-                                // Node.js
-                                "nodejs",
-                                "nodejs-npm",
-                                // Python deps
-                                "libffi",
-                                "gdbm",
-                                "xz-libs",
-                                "mpdecimal",
-                                "readline",
-                                "libpanelw",
-                                // Python
-                                "python3",
-                                "py3-pip",
-                                "py3-setuptools",
-                        )
-
-                onProgress?.invoke("Fetching Alpine package index (main + community)…")
-                _setupState.value = SetupState.InProgress("Fetching package list…", 0.70f)
-
-                // packageName → Pair(filename, repoBaseUrl)
-                val packageMap = mutableMapOf<String, Pair<String, String>>()
-
-                // Fetch APKINDEX from both repos
-                for ((repoName, repoUrl) in listOf("main" to mainBase, "community" to communityBase)) {
-                    val indexUrl = "$repoUrl/APKINDEX.tar.gz"
-                    val indexFile = File(baseDir, "APKINDEX_${repoName}.tar.gz")
-
-                    try {
-                        downloadFile(indexUrl, indexFile)
-                        val indexDir = File(baseDir, "apkindex_${repoName}_tmp")
-                        indexDir.mkdirs()
-                        extractTarGz(indexFile, indexDir)
-                        val apkIndexFile = File(indexDir, "APKINDEX")
-                        if (apkIndexFile.exists()) {
-                            var currentName = ""
-                            var currentVersion = ""
-                            apkIndexFile.readLines().forEach { line ->
-                                when {
-                                    line.startsWith("P:") -> currentName = line.substring(2)
-                                    line.startsWith("V:") -> currentVersion = line.substring(2)
-                                    line.isEmpty() -> {
-                                        if (currentName.isNotEmpty() && currentVersion.isNotEmpty()) {
-                                            // Don't overwrite if already in main
-                                            if (currentName !in packageMap) {
-                                                packageMap[currentName] =
-                                                        "$currentName-$currentVersion.apk" to repoUrl
-                                            }
-                                        }
-                                        currentName = ""
-                                        currentVersion = ""
-                                    }
-                                }
-                            }
-                            // Handle last entry (file may not end with blank line)
-                            if (currentName.isNotEmpty() && currentVersion.isNotEmpty()) {
-                                if (currentName !in packageMap) {
-                                    packageMap[currentName] =
-                                            "$currentName-$currentVersion.apk" to repoUrl
-                                }
-                            }
-                        }
-                        indexDir.deleteRecursively()
-                        onProgress?.invoke("✓ $repoName index loaded")
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Failed to fetch APKINDEX from $repoName", e)
-                        val msg = "✗ Failed to fetch $repoName index: ${e.message}"
-                        sb.appendLine(msg)
-                        onProgress?.invoke(msg)
-                    } finally {
-                        indexFile.delete()
-                    }
-                }
-
-                onProgress?.invoke("  ${packageMap.size} total packages available")
-
-                val totalPackages = packages.size
-                var installed = 0
-
-                for ((index, pkgName) in packages.withIndex()) {
-                    val entry = packageMap[pkgName]
-                    if (entry == null) {
-                        val msg = "✗ $pkgName: not found in repository"
-                        sb.appendLine(msg)
-                        onProgress?.invoke(msg)
-                        Log.w(TAG, "Package not found in APKINDEX: $pkgName")
-                        continue
-                    }
-
-                    val (filename, repoUrl) = entry
-                    val progress = 0.72f + 0.25f * index / totalPackages
-                    _setupState.value =
-                            SetupState.InProgress(
-                                    "Installing $pkgName… (${index + 1}/$totalPackages)",
-                                    progress
+                        val osRelease = File(rootfsDir, "etc/os-release")
+                        if (!osRelease.exists()) {
+                            progress("Downloading Ubuntu rootfs…", 0.20f)
+                            val tarball = File(baseDir, "ubuntu.tar.xz")
+                            downloadWithFallback(
+                                    listOf(UBUNTU_ROOTFS_URL, UBUNTU_ROOTFS_URL_FALLBACK),
+                                    tarball
                             )
-                    onProgress?.invoke("⏳ Installing $pkgName… (${index + 1}/$totalPackages)")
+                            progress("Extracting rootfs…", 0.60f)
+                            extractArchive(tarball, rootfsDir)
+                            tarball.delete()
+                        }
 
-                    val pkgFile = File(baseDir, filename)
-                    try {
-                        downloadFile("$repoUrl/$filename", pkgFile)
-                        extractTarGz(pkgFile, rootfsDir)
-                        installed++
-                        val msg = "✓ $pkgName installed"
-                        sb.appendLine(msg)
-                        onProgress?.invoke(msg)
-                        Log.d(TAG, "Installed: $pkgName")
+                        progress("Configuring rootfs…", 0.80f)
+                        normalizeRootfsLayout()
+                        setupFakeProcFiles()
+                        configureRootfs()
+
+                        // Pre-install Python and Node.js directly into the
+                        // rootfs — we don't use apt/dpkg for these.
+                        installPrebuiltBinaries()
+
+                        prefs.edit()
+                                .putBoolean(KEY_INITIALIZED, true)
+                                .putInt(KEY_ENV_VERSION, CURRENT_ENV_VERSION)
+                                .apply()
+
+                        _setupState.value = SetupState.Ready
+                        appendLog("Ubuntu runtime is ready")
                     } catch (e: Exception) {
-                        val msg = "✗ $pkgName failed: ${e.message}"
-                        sb.appendLine(msg)
-                        onProgress?.invoke(msg)
-                        Log.e(TAG, "Failed to install $pkgName", e)
-                    } finally {
-                        pkgFile.delete()
+                        Log.e(TAG, "Setup failed", e)
+                        fail("Setup failed: ${e.message}")
                     }
                 }
-
-                // Make all installed binaries executable
-                listOf("usr/bin", "usr/local/bin", "usr/sbin", "bin").forEach { binPath ->
-                    File(rootfsDir, binPath).listFiles()?.forEach { it.setExecutable(true, false) }
-                }
-
-                // Create npm/pip symlinks if they don't exist
-                createBinSymlink("usr/bin/npm", "usr/bin/node")
-                createBinSymlink("usr/bin/pip3", "usr/bin/python3")
-                createBinSymlink("usr/bin/pip", "usr/bin/pip3")
-                createBinSymlink("usr/bin/python", "usr/bin/python3")
-
-                // Fix shared library symlinks that Alpine's .apk may have left broken
-                fixSharedLibSymlinks()
-
-                sb.appendLine("─────────────────────────")
-                sb.appendLine("$installed/$totalPackages packages installed")
-
-                prefs.edit().putBoolean(KEY_TOOLCHAIN_READY, true).apply()
-                _setupState.value = SetupState.Ready
-                Log.d(TAG, "Toolchain install complete: $installed/$totalPackages")
-                sb.toString()
             }
 
-    /**
-     * Create a bin symlink by copying the target binary.
-     * Android proot can't always create real symlinks, so we copy instead.
-     */
-    private fun createBinSymlink(linkPath: String, targetPath: String) {
-        val link = File(rootfsDir, linkPath)
-        val target = File(rootfsDir, targetPath)
-        if (!link.exists() && target.exists()) {
-            try {
-                target.copyTo(link, overwrite = false)
-                link.setExecutable(true, false)
-                Log.d(TAG, "Created bin link: $linkPath → $targetPath")
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to create bin link $linkPath: ${e.message}")
+    suspend fun reset() =
+            withContext(Dispatchers.IO) {
+                initJob?.cancel()
+                baseDir.deleteRecursively()
+                prefs.edit().clear().apply()
+                _setupLogs.value = emptyList()
+                _setupState.value = SetupState.NotStarted
+                appendLog("Ubuntu runtime reset")
             }
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  Fake /proc files
+    // ─────────────────────────────────────────────────────────────────────
+
+    private fun setupFakeProcFiles() {
+        val procDir = File(rootfsDir, "proc").apply { mkdirs() }
+        File(rootfsDir, "sys/.empty").mkdirs()
+
+        writeIfMissing(File(procDir, ".loadavg"), "0.12 0.07 0.02 2/165 765\n")
+        writeIfMissing(
+                File(procDir, ".stat"),
+                "cpu  1957 0 2877 93280 262 342 254 87 0 0\ncpu0 31 0 226 12027 82 10 4 9 0 0\n"
+        )
+        writeIfMissing(File(procDir, ".uptime"), "124.08 932.80\n")
+        writeIfMissing(
+                File(procDir, ".version"),
+                "Linux version 5.4.0-PRoot (proot@cloudide) #1 SMP PREEMPT\n"
+        )
+        writeIfMissing(
+                File(procDir, ".vmstat"),
+                "nr_free_pages 1743136\nnr_zone_inactive_anon 179281\n"
+        )
+        writeIfMissing(File(procDir, ".sysctl_entry_cap_last_cap"), "40\n")
+        writeIfMissing(File(procDir, ".sysctl_inotify_max_user_watches"), "4096\n")
+
+        val fipsDir = File(tmpDir, ".fake_proc/sys/crypto").apply { mkdirs() }
+        writeIfMissing(File(fipsDir, "fips_enabled"), "0\n")
+    }
+
+    private fun writeIfMissing(file: File, content: String) {
+        if (!file.exists()) {
+            file.parentFile?.mkdirs()
+            file.writeText(content)
         }
     }
 
-    /**
-     * After extracting .apk files, many shared libraries exist as versioned files (e.g.
-     * libz.so.1.3.1) but not as the unversioned symlink (libz.so.1) that binaries actually link
-     * against. This resolves those by copying the versioned file to the expected soname.
-     */
-    private fun fixSharedLibSymlinks() {
-        val libDirs =
-                listOf(
-                        File(rootfsDir, "lib"),
-                        File(rootfsDir, "usr/lib"),
-                        File(rootfsDir, "lib/aarch64-linux-musl"),
-                        File(rootfsDir, "usr/lib/aarch64-linux-gnu"),
-                )
+    // ─────────────────────────────────────────────────────────────────────
+    //  PRoot command builders
+    // ─────────────────────────────────────────────────────────────────────
 
-        // Map of soname → versioned filename pattern
-        val sonameMappings =
-                mapOf(
-                        "libz.so.1" to "libz.so.1.",
-                        "libssl.so.3" to "libssl.so.3.",
-                        "libcrypto.so.3" to "libcrypto.so.3.",
-                        "libstdc++.so.6" to "libstdc++.so.6.",
-                        "libgcc_s.so.1" to "libgcc_s.so.1",
-                        "libuv.so.1" to "libuv.so.1.",
-                        "libicui18n.so" to "libicui18n.so.",
-                        "libicuuc.so" to "libicuuc.so.",
-                        "libicudata.so" to "libicudata.so.",
-                        "libnghttp2.so.14" to "libnghttp2.so.14.",
-                        "libcares.so.2" to "libcares.so.2.",
-                        "libbrotlidec.so.1" to "libbrotlidec.so.1.",
-                        "libbrotlienc.so.1" to "libbrotlienc.so.1.",
-                        "libbrotlicommon.so.1" to "libbrotlicommon.so.1.",
-                        "libzstd.so.1" to "libzstd.so.1.",
-                        "libsqlite3.so.0" to "libsqlite3.so.0.",
-                        "libffi.so.8" to "libffi.so.8.",
-                        "libreadline.so.8" to "libreadline.so.8.",
-                        "libpython3.so" to "libpython3.",
-                        // Node.js 22+ deps (Alpine 3.21)
-                        "libada.so.2" to "libada.so.2.",
-                        "libada.so" to "libada.so.",
-                        "libsimdjson.so.23" to "libsimdjson.so.23.",
-                        "libsimdjson.so" to "libsimdjson.so.",
-                        "libsimdutf.so.11" to "libsimdutf.so.11.",
-                        "libsimdutf.so" to "libsimdutf.so.",
-                        // ncurses (for Python's readline)
-                        "libncursesw.so.6" to "libncursesw.so.6.",
-                        "libpanelw.so.6" to "libpanelw.so.6.",
-                )
-
-        for (dir in libDirs) {
-            if (!dir.exists()) continue
-            val files = dir.listFiles() ?: continue
-
-            for ((soname, prefix) in sonameMappings) {
-                val target = File(dir, soname)
-                if (target.exists() && target.length() > 0) continue // already fine
-
-                // Find the versioned file
-                val versioned =
-                        files.firstOrNull {
-                            it.name.startsWith(prefix) && it.isFile && it.length() > 0
-                        }
-                                ?: continue
-
-                try {
-                    versioned.copyTo(target, overwrite = true)
-                    target.setExecutable(true, false)
-                    Log.d(TAG, "Fixed soname: ${versioned.name} → $soname in ${dir.name}")
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to fix soname $soname: ${e.message}")
-                }
-            }
+    private fun buildProotArgs(): MutableList<String> {
+        val fipsFile = File(tmpDir, ".fake_proc/sys/crypto/fips_enabled")
+        if (!fipsFile.exists()) {
+            fipsFile.parentFile?.mkdirs()
+            fipsFile.writeText("0\n")
         }
+        val rd = rootfsDir.canonicalPath
+        val args =
+                mutableListOf(
+                        prootBinary.canonicalPath,
+                        "--kill-on-exit",
+                        // --link2symlink: emulate hardlinks via symlinks into
+                        // a central .l2s/ dir. Required because Android blocks
+                        // real link() syscalls (fs.protected_hardlinks=1) in
+                        // app data, and dpkg uses link() for status backup.
+                        // eliminateL2sStructure() wipes the tarball's old
+                        // l2s residue before proot starts, so proot creates
+                        // its own clean l2s state from scratch — no ENOSYS.
+                        "--link2symlink",
+                        "--root-id",
+                        "--kernel-release=5.4.0",
+                        "--rootfs=$rd",
+                        "--cwd=/root",
+                        "--bind=/dev",
+                        "--bind=/proc",
+                        "--bind=/sys",
+                        "--bind=/dev/urandom:/dev/random",
+                        "--bind=/proc/self/fd:/dev/fd",
+                        "--bind=/proc/self/fd/0:/dev/stdin",
+                        "--bind=/proc/self/fd/1:/dev/stdout",
+                        "--bind=/proc/self/fd/2:/dev/stderr",
+                        "--bind=$rd/proc/.loadavg:/proc/loadavg",
+                        "--bind=$rd/proc/.stat:/proc/stat",
+                        "--bind=$rd/proc/.uptime:/proc/uptime",
+                        "--bind=$rd/proc/.version:/proc/version",
+                        "--bind=$rd/proc/.vmstat:/proc/vmstat",
+                        "--bind=$rd/proc/.sysctl_entry_cap_last_cap:/proc/sys/kernel/cap_last_cap",
+                        "--bind=$rd/proc/.sysctl_inotify_max_user_watches:/proc/sys/fs/inotify/max_user_watches",
+                        "--bind=${fipsFile.canonicalPath}:/proc/sys/crypto/fips_enabled",
+                        "--bind=$rd/sys/.empty:/sys/fs/selinux",
+                        "--bind=${tmpDir.canonicalPath}:/tmp",
+                )
+        listOf("/system", "/apex", "/linkerconfig", "/data").forEach { path ->
+            if (File(path).exists()) args.add("--bind=$path")
+        }
+        return args
     }
 
-    /**
-     * Build the proot command to execute a command inside the Linux environment.
-     *
-     * FIX: Added -k flag to spoof kernel version (some Android kernels report versions that confuse
-     * Alpine's glibc checks). Added proper LD_LIBRARY_PATH binding so shared libraries inside the
-     * rootfs are found at runtime.
-     */
     fun buildProotCommand(
             command: String,
             projectDir: File? = null,
             env: Map<String, String> = emptyMap(),
     ): List<String> {
-        val cmd =
-                mutableListOf(
-                        prootBinary.absolutePath,
-                        "--link2symlink", // resolve symlinks Android can't create natively
-                        "--kill-on-exit", // clean up child processes on exit
-                        "-0", // fake root (uid=0), required for apk/pip install
-                        "-k",
-                        "5.4.0", // spoof kernel version for musl compatibility
-                        "--rootfs=${rootfsDir.absolutePath}",
-                        "-w",
-                        if (projectDir != null) "/home/project" else "/root",
-                        "-b",
-                        "/dev",
-                        "-b",
-                        "/proc",
-                        "-b",
-                        "/sys",
-                        "-b",
-                        "${tmpDir.absolutePath}:/tmp",
-                        "-b",
-                        "${packagesDir.absolutePath}:/opt/packages",
-                )
-
+        val cmd = buildProotArgs()
         if (projectDir != null && projectDir.isDirectory) {
-            cmd.addAll(listOf("-b", "${projectDir.absolutePath}:/home/project"))
+            cmd.add("--bind=${projectDir.canonicalPath}:$WORKSPACE_MOUNT_PATH")
         }
-
-        cmd.addAll(listOf("/bin/sh", "-c", command))
+        cmd.addAll(loginEnvVars())
+        cmd.add("/bin/bash")
+        cmd.add("-c")
+        cmd.add(buildEnvWrapper(command, env))
         return cmd
     }
 
-    /** Build proot command for an interactive shell session. */
     fun buildInteractiveShellCommand(projectDir: File? = null): List<String> {
-        val cmd =
-                mutableListOf(
-                        prootBinary.absolutePath,
-                        "--link2symlink",
-                        "--kill-on-exit",
-                        "-0",
-                        "-k",
-                        "5.4.0",
-                        "--rootfs=${rootfsDir.absolutePath}",
-                        "-w",
-                        if (projectDir != null) "/home/project" else "/root",
-                        "-b",
-                        "/dev",
-                        "-b",
-                        "/proc",
-                        "-b",
-                        "/sys",
-                        "-b",
-                        "${tmpDir.absolutePath}:/tmp",
-                        "-b",
-                        "${packagesDir.absolutePath}:/opt/packages",
-                )
-
+        val cmd = buildProotArgs()
         if (projectDir != null && projectDir.isDirectory) {
-            cmd.addAll(listOf("-b", "${projectDir.absolutePath}:/home/project"))
+            cmd.add("--bind=${projectDir.canonicalPath}:$WORKSPACE_MOUNT_PATH")
         }
-
-        // Login shell sources /root/.profile which prints the welcome banner
-        cmd.addAll(listOf("/bin/sh", "-l"))
+        cmd.addAll(loginEnvVars())
+        cmd.add("/bin/bash")
+        cmd.add("--login")
         return cmd
     }
 
-    // ───────── Private helpers ─────────
+    private fun loginEnvVars(): List<String> =
+            listOf(
+                    "/usr/bin/env",
+                    "-i",
+                    "HOME=/root",
+                    "PWD=/root",
+                    "LANG=C.UTF-8",
+                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    "TERM=xterm-256color",
+                    "TMPDIR=/tmp",
+                    "DEBIAN_FRONTEND=noninteractive",
+            )
 
-    private fun ensureDirectories() {
-        baseDir.mkdirs()
-        rootfsDir.mkdirs()
-        binDir.mkdirs()
-        libDir.mkdirs()
-        packagesDir.mkdirs()
-        tmpDir.mkdirs()
+    private fun buildEnvWrapper(command: String, extraEnv: Map<String, String>): String {
+        val escaped = command.replace("\\", "\\\\").replace("\"", "\\\"")
+        val extras =
+                extraEnv.entries.joinToString("\n") { (k, v) ->
+                    "export $k=\"${v.replace("\"", "\\\"")}\""
+                }
+        return buildString {
+            appendLine("cd /root 2>/dev/null || true")
+            if (extras.isNotEmpty()) appendLine(extras)
+            append(escaped)
+        }
     }
+
+    internal fun populateHostEnv(env: MutableMap<String, String>) {
+        val nativeDir = File(context.applicationInfo.nativeLibraryDir).canonicalPath
+        env["PROOT_TMP_DIR"] = tmpDir.canonicalPath
+        env["LD_LIBRARY_PATH"] = libDir.canonicalPath
+        File(nativeDir, "libproot-loader.so").takeIf { it.exists() }?.let {
+            env["PROOT_LOADER"] = it.canonicalPath
+        }
+        File(nativeDir, "libproot-loader32.so").takeIf { it.exists() }?.let {
+            env["PROOT_LOADER_32"] = it.canonicalPath
+        }
+        // PROOT_L2S_DIR intentionally NOT set. With it set to a central
+        // directory, proot's l2s rename(src, /.l2s/<x>.0002) returned
+        // ENOSYS for cross-directory moves. Unset = scattered mode:
+        // proot places .l2s.*.0001 and .l2s.*.0002 next to the source
+        // file (intra-directory rename, always works).
+        env["PROOT_NO_SECCOMP"] = "1"
+        env["HOME"] = "/root"
+        env["TERM"] = "xterm-256color"
+        env["LANG"] = "C.UTF-8"
+        env["SHELL"] = "/bin/bash"
+        env["TMPDIR"] = "/tmp"
+        env["PATH"] = "$nativeDir:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    }
+
+    internal fun configureHostEnvironment(pb: ProcessBuilder) {
+        populateHostEnv(pb.environment())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  Rootfs configuration
+    // ─────────────────────────────────────────────────────────────────────
+
+    private fun configureRootfs() {
+        // Standard dirs
+        File(rootfsDir, "workspace").mkdirs()
+        File(rootfsDir, "root").mkdirs()
+        File(rootfsDir, "tmp").apply {
+            mkdirs()
+            setWritable(true, false)
+        }
+        File(rootfsDir, "var/lib/apt/lists/partial").mkdirs()
+        File(rootfsDir, "var/cache/apt/archives/partial").mkdirs()
+
+        // Clean up stale dpkg / apt locks
+        listOf(
+                        "var/lib/dpkg/lock",
+                        "var/lib/dpkg/lock-frontend",
+                        "var/cache/apt/archives/lock",
+                        "var/lib/apt/lists/lock",
+                )
+                .forEach { File(rootfsDir, it).delete() }
+        File(rootfsDir, "var/lib/dpkg/updates").listFiles()?.forEach { it.delete() }
+
+        // ── Eliminate stale l2s structure from the tarball.
+        //    No need to recreate /.l2s/ — we use scattered l2s mode now,
+        //    where proot creates .l2s.* files next to each source file.
+        eliminateL2sStructure()
+
+        // ── Pre-seed dpkg backup files to avoid renameat2(RENAME_EXCHANGE) ──
+        // dpkg 1.22+ (Ubuntu 25.10) uses renameat2() with RENAME_EXCHANGE to
+        // atomically swap status↔status-old and available↔available-old.
+        // Android kernels return ENOSYS for RENAME_EXCHANGE. When the *-old
+        // file already exists, dpkg detects it and falls back to a plain
+        // rename() which proot handles correctly. Pre-seeding them here covers
+        // the very first dpkg run; the wrapper below covers subsequent runs.
+        val dpkgStateDir = File(rootfsDir, "var/lib/dpkg")
+        listOf("status", "available").forEach { name ->
+            val src = File(dpkgStateDir, name)
+            val bak = File(dpkgStateDir, "$name-old")
+            if (src.exists() && !bak.exists()) {
+                try {
+                    src.copyTo(bak, overwrite = false)
+                    bak.setReadable(true, false)
+                    bak.setWritable(true, false)
+                } catch (_: Exception) {}
+            }
+        }
+
+        // ── Make dpkg / apt state dirs fully writable ───────────────────────
+        fun chmodAllWritable(root: File) {
+            if (!root.exists()) return
+            if (root.isDirectory) {
+                root.setReadable(true, false)
+                root.setWritable(true, false)
+                root.setExecutable(true, false)
+                root.listFiles()?.forEach { chmodAllWritable(it) }
+            } else {
+                root.setReadable(true, false)
+                root.setWritable(true, false)
+            }
+        }
+        listOf(
+                        "var/lib/dpkg",
+                        "var/cache/apt",
+                        "var/lib/apt",
+                        "etc/apt",
+                )
+                .forEach { chmodAllWritable(File(rootfsDir, it)) }
+
+        // ── DNS ──
+        val etcDir = File(rootfsDir, "etc").apply { mkdirs() }
+        File(etcDir, "resolv.conf").apply {
+            if (Files.isSymbolicLink(toPath())) delete()
+            writeText("nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 8.8.4.4\n")
+        }
+
+        // ── apt sources ──
+        val aptDir = File(etcDir, "apt").apply { mkdirs() }
+        File(aptDir, "sources.list")
+                .writeText(
+                        """
+            deb http://ports.ubuntu.com/ubuntu-ports $UBUNTU_CODENAME main restricted universe multiverse
+            deb http://ports.ubuntu.com/ubuntu-ports $UBUNTU_CODENAME-updates main restricted universe multiverse
+            deb http://ports.ubuntu.com/ubuntu-ports $UBUNTU_CODENAME-security main restricted universe multiverse
+            """.trimIndent() +
+                                "\n"
+                )
+
+        // ── apt config ──
+        val aptConf = File(aptDir, "apt.conf.d").apply { mkdirs() }
+        val problematicHooks =
+                listOf(
+                        "esm",
+                        "snap",
+                        "appstream",
+                        "notifier",
+                        "command-not-found",
+                        "listchanges",
+                        "popularity",
+                        "motd",
+                        "autoremove",
+                        "kernel-versions",
+                        "pkgcache",
+                        "fwupd",
+                        "speech-dispatcher",
+                        "cnf-update",
+                        "update-stamp",
+                        "packagekit",
+                        "unattended",
+                        "debconf",
+                )
+        aptConf.listFiles()?.forEach { f ->
+            val n = f.name.lowercase()
+            if (problematicHooks.any { n.contains(it) }) f.delete()
+        }
+        File(aptConf, "00-cloudide-android").delete()
+        File(aptConf, "99-cloudide.conf")
+                .writeText(
+                        """
+            // Skip GPG / signature checks
+            Acquire::GPGCheck "false";
+            Acquire::AllowInsecureRepositories "true";
+            Acquire::AllowDowngradeToInsecureRepositories "true";
+            Acquire::Check-Valid-Until "false";
+            Acquire::Languages "none";
+
+            // Disable apt sandbox (we are root inside proot)
+            APT::Sandbox::User "root";
+            APT::Sandbox::Seccomp "false";
+            APT::Get::AllowUnauthenticated "true";
+
+            // Auto-confirm
+            APT::Get::Assume-Yes "true";
+            APT::Get::Fix-Missing "true";
+
+            // Sequential downloads
+            Acquire::Queue-Mode "access";
+            Acquire::http::Pipeline-Depth "0";
+            Acquire::http::No-Cache "true";
+            Acquire::Retries "3";
+            Acquire::http::Timeout "60";
+
+            // Disable apt's PTY allocation for dpkg entirely.
+            // Our apt/apt-get wrappers pipe stdout through cat so isatty()
+            // returns false, but belt-and-suspenders in config too.
+            Dpkg::Use-Pty "false";
+            DPkg::Use-Pty "false";
+            Dir::Log::Terminal "";
+            Dir::Log::History "";
+
+            // dpkg force flags
+            DPkg::Options:: "--force-confold";
+            DPkg::Options:: "--force-confdef";
+            DPkg::Options:: "--force-overwrite";
+            DPkg::Options:: "--force-unsafe-io";
+
+            // Clear all post-invoke hook lists
+            #clear APT::Update::Pre-Invoke;
+            #clear APT::Update::Post-Invoke;
+            #clear APT::Update::Post-Invoke-Success;
+            #clear APT::Install::Pre-Invoke;
+            #clear APT::Install::Post-Invoke;
+            #clear APT::Install::Post-Invoke-Success;
+            #clear DPkg::Pre-Invoke;
+            #clear DPkg::Post-Invoke;
+            #clear DPkg::Pre-Install-Pkgs;
+            """.trimIndent() +
+                                "\n"
+                )
+
+        // ── dpkg config ──
+        File(rootfsDir, "etc/dpkg/dpkg.cfg.d").mkdirs()
+        File(rootfsDir, "etc/dpkg/dpkg.cfg.d/01-cloudide")
+                .writeText(
+                        // force-script-chrootless: skip chroot-specific checks that fail
+                        // under proot (added in dpkg 1.21.x, harmless on older versions).
+                        "force-confold\nforce-confdef\nforce-overwrite\nforce-unsafe-io\nno-debsig\nforce-script-chrootless\n"
+                )
+
+        // ── Profile / login scripts ──
+        val profileDir = File(etcDir, "profile.d").apply { mkdirs() }
+        File(profileDir, "00-cloudide.sh")
+                .writeText(
+                        """
+            cd /root 2>/dev/null || cd / 2>/dev/null || true
+            export HOME=/root
+            export TMPDIR=/tmp
+            export LANG=C.UTF-8
+            export DEBIAN_FRONTEND=noninteractive
+            export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            export PS1='\u@cloudide:\w\$ '
+            """.trimIndent() +
+                                "\n"
+                )
+
+        File(rootfsDir, "root/.bash_profile").apply {
+            parentFile?.mkdirs()
+            writeText("[ -f /etc/profile ] && . /etc/profile\n[ -f ~/.bashrc ] && . ~/.bashrc\n")
+        }
+        File(rootfsDir, "root/.profile").apply {
+            parentFile?.mkdirs()
+            writeText("[ -f /etc/profile ] && . /etc/profile\n[ -f ~/.bashrc ] && . ~/.bashrc\n")
+        }
+        File(rootfsDir, "root/.bashrc").apply {
+            parentFile?.mkdirs()
+            writeText(
+                    """
+                cd /root 2>/dev/null || true
+                alias ll='ls -la'
+                alias la='ls -la'
+                alias apt='apt-get'
+                """.trimIndent() +
+                            "\n"
+            )
+        }
+
+        // ── Service-control stubs ──
+        File(rootfsDir, "usr/sbin/policy-rc.d").apply {
+            parentFile?.mkdirs()
+            writeText("#!/bin/sh\nexit 101\n")
+            setExecutable(true, false)
+        }
+
+        val noopStubs =
+                listOf(
+                        "usr/bin/systemctl",
+                        "bin/systemctl",
+                        "usr/sbin/initctl",
+                        "sbin/initctl",
+                        "usr/sbin/invoke-rc.d",
+                        "usr/sbin/update-rc.d",
+                        "usr/sbin/dpkg-preconfigure",
+                        "usr/bin/deb-systemd-helper",
+                        "usr/bin/deb-systemd-invoke",
+                        "usr/bin/sensible-editor",
+                        "usr/bin/sensible-pager",
+                        "usr/bin/sensible-browser",
+                )
+        noopStubs.forEach { rel ->
+            File(rootfsDir, rel).apply {
+                parentFile?.mkdirs()
+                writeText("#!/bin/sh\nexit 0\n")
+                setExecutable(true, false)
+            }
+        }
+        File(rootfsDir, "usr/sbin/runlevel").apply {
+            parentFile?.mkdirs()
+            writeText("#!/bin/sh\necho 'N 5'\nexit 0\n")
+            setExecutable(true, false)
+        }
+
+        // ── Remove legacy wrappers from older versions ──
+        File(rootfsDir, "usr/local/sbin/dpkg-proot").delete()
+        val gpgvBin = File(rootfsDir, "usr/bin/gpgv")
+        val gpgvReal = File(rootfsDir, "usr/bin/gpgv.real")
+        if (gpgvReal.exists()) {
+            gpgvBin.delete()
+            gpgvReal.renameTo(gpgvBin)
+        }
+
+        // ── Copy renameat2 LD_PRELOAD shim into rootfs ──────────────────
+        // The shim is compiled by NDK with -nostdlib (no Bionic dependency).
+        // It intercepts renameat2(RENAME_EXCHANGE) and emulates it with
+        // three plain renameat() raw syscalls that the kernel handles.
+        val shimSrc = File(context.applicationInfo.nativeLibraryDir, "librenameat2-fix.so")
+        val shimDst = File(rootfsDir, "usr/local/lib/librenameat2-fix.so")
+        if (shimSrc.exists()) {
+            shimDst.parentFile?.mkdirs()
+            shimSrc.copyTo(shimDst, overwrite = true)
+            shimDst.setReadable(true, false)
+            shimDst.setExecutable(true, false)
+        }
+
+        // ── dpkg wrapper: pre-touch backup files before every dpkg run ───────
+        // Ensures status-old / available-old always exist before dpkg starts,
+        // so dpkg never needs renameat2(RENAME_EXCHANGE) — it finds the file
+        // already present and uses a regular rename() that proot supports.
+        //
+        // Also handles restoring real dpkg if a previous version of this app
+        // left a trace wrapper at /usr/bin/dpkg with dpkg.real alongside it.
+        val dpkgBin = File(rootfsDir, "usr/bin/dpkg")
+        val dpkgReal = File(rootfsDir, "usr/bin/dpkg.real")
+
+        // If an old trace-wrapper version left dpkg.real, restore the real binary first.
+        if (dpkgReal.exists()) {
+            dpkgBin.delete()
+            dpkgReal.renameTo(dpkgBin)
+            dpkgBin.setExecutable(true, false)
+        }
+
+        // Now install our thin pre-touch wrapper.
+        if (dpkgBin.exists()) {
+            // Move real dpkg aside (safe to redo — copyTo with overwrite=false is a no-op)
+            if (!dpkgReal.exists()) {
+                dpkgBin.copyTo(dpkgReal, overwrite = false)
+                dpkgReal.setExecutable(true, false)
+            }
+            val D = "${'$'}"
+            // Write wrapper — always overwrite so it stays current across version bumps.
+            dpkgBin.writeText(
+                    "#!/bin/sh\n" +
+                            "# Convert l2s symlinks to real files; pre-seed *-old so dpkg skips renameat2\n" +
+                            "for _f in /var/lib/dpkg/status /var/lib/dpkg/status-old /var/lib/dpkg/available; do\n" +
+                            "    [ -L \"${D}_f\" ] || continue\n" +
+                            "    cp --no-preserve=all \"${D}_f\" /tmp/.dpkg.l2s.fix 2>/dev/null || continue\n" +
+                            "    rm -f \"${D}_f\"\n" +
+                            "    cp --no-preserve=all /tmp/.dpkg.l2s.fix \"${D}_f\" 2>/dev/null || true\n" +
+                            "    rm -f /tmp/.dpkg.l2s.fix\n" +
+                            "done\n" +
+                            "# Ensure critical dpkg DB files exist (empty is valid)\n" +
+                            "for _f in /var/lib/dpkg/status /var/lib/dpkg/available; do\n" +
+                            "    [ -e \"${D}_f\" ] || touch \"${D}_f\" 2>/dev/null || true\n" +
+                            "done\n" +
+                            "# Pre-seed backup files so dpkg uses rename() not renameat2()\n" +
+                            "for _f in /var/lib/dpkg/status /var/lib/dpkg/available; do\n" +
+                            "    _old=\"${D}{_f}-old\"\n" +
+                            "    [ -e \"${D}_old\" ] || { [ -e \"${D}_f\" ] && cp --no-preserve=all \"${D}_f\" \"${D}_old\" 2>/dev/null || touch \"${D}_old\" 2>/dev/null || true; }\n" +
+                            "done\n" +
+                            "unset _f _old\n" +
+                            "# LD_PRELOAD shim: emulates renameat2(RENAME_EXCHANGE) with three renameat() calls\n" +
+                            "[ -f /usr/local/lib/librenameat2-fix.so ] && export LD_PRELOAD=\"/usr/local/lib/librenameat2-fix.so${D}{LD_PRELOAD:+:${D}LD_PRELOAD}\"\n" +
+                            "exec /usr/bin/dpkg.real \"${D}@\"\n"
+            )
+            dpkgBin.setExecutable(true, false)
+        }
+
+        // ── apt / apt-get wrappers ───────────────────────────────────────────
+        // apt/dpkg fundamentally don't work in this environment (Android blocks
+        // hardlinks, proot's link2symlink emulation hits ENOSYS in too many
+        // edge cases). Instead of pretending, the wrappers print a friendly
+        // message pointing at the pre-installed binaries.
+        val aptStubBody =
+                "#!/bin/sh\n" +
+                        "cat <<'EOF' >&2\n" +
+                        "apt/dpkg are disabled in this environment — Android filesystem\n" +
+                        "restrictions block dpkg's hardlink-based backup mechanism.\n" +
+                        "\n" +
+                        "Python (with pip) and Node.js (with npm) are pre-installed:\n" +
+                        "  python3 --version\n" +
+                        "  pip3 install <package>\n" +
+                        "  node --version\n" +
+                        "  npm install <package>\n" +
+                        "\n" +
+                        "To install other Python packages, use pip3 instead of apt.\n" +
+                        "EOF\n" +
+                        "exit 1\n"
+        listOf("usr/local/bin/apt", "usr/local/bin/apt-get").forEach { rel ->
+            File(rootfsDir, rel).apply {
+                parentFile?.mkdirs()
+                writeText(aptStubBody)
+                setExecutable(true, false)
+            }
+        }
+    }
+
+    /**
+     * Wipes every trace of proot's link2symlink (l2s) emulation from the rootfs.
+     *
+     * The Termux Ubuntu tarball was packed with `--link2symlink`, so files that were originally
+     * hardlinks (dpkg's `status`, many `dpkg-divert` files, lots of locale/man symlinks, etc.)
+     * arrive on disk as **symlinks pointing into a central `/.l2s/` directory** that holds the
+     * actual file content.
+     *
+     * That structure ONLY works if proot is also launched with `--link2symlink` AND it's a
+     * "complete" l2s setup. A partial state — some entries plain, some still pointing into `.l2s/`
+     * — confuses proot's path resolution and it returns ENOSYS for every syscall touching the
+     * affected paths (including `chdir`, `open`, `rename` — anything).
+     *
+     * This function runs on the Android JVM BEFORE proot starts, so it has full direct filesystem
+     * access. Walk the whole rootfs; for every symlink whose target resolves into `<rootfs>/.l2s/`,
+     * copy the target's content to a temp file and rename it onto the symlink path. After all
+     * conversions, delete `<rootfs>/.l2s/` entirely. The result is a rootfs with zero l2s structure
+     * — every original hardlink is now an independent file copy.
+     *
+     * Trade-off: rootfs size grows by however much was previously dedup'd via hardlinks (usually a
+     * few MB). We accept that to get correctness.
+     */
+    private fun eliminateL2sStructure() {
+        val l2sDir = File(rootfsDir, ".l2s")
+        if (!l2sDir.exists()) return // already done or never had l2s
+
+        val l2sBasePath = l2sDir.canonicalPath
+        Log.d(TAG, "Eliminating l2s structure under: $l2sBasePath")
+
+        var converted = 0
+        var broken = 0
+        var failed = 0
+
+        rootfsDir.walkTopDown().forEach { f ->
+            // Skip the .l2s tree itself — we delete it wholesale at the end.
+            if (f.absolutePath.startsWith(l2sBasePath)) return@forEach
+
+            try {
+                if (!Files.isSymbolicLink(f.toPath())) return@forEach
+
+                // Resolve the symlink. canonicalFile follows it to the target.
+                val resolved =
+                        try {
+                            f.canonicalFile
+                        } catch (_: Exception) {
+                            return@forEach
+                        }
+                if (!resolved.canonicalPath.startsWith(l2sBasePath)) {
+                    // Not an l2s symlink — leave it alone (could be /bin -> /usr/bin).
+                    return@forEach
+                }
+                if (!resolved.exists()) {
+                    // Broken l2s symlink. Drop it so it doesn't break path
+                    // resolution. dpkg's createNewFile fallback below will
+                    // re-create the dpkg DB files if needed.
+                    Files.deleteIfExists(f.toPath())
+                    broken++
+                    return@forEach
+                }
+
+                val tmp = File(f.parentFile, ".l2sfix.${f.name}.tmp")
+                resolved.copyTo(tmp, overwrite = true)
+                tmp.setReadable(true, false)
+                tmp.setWritable(true, false)
+                Files.delete(f.toPath()) // delete the symlink (not the target)
+                tmp.renameTo(f)
+                converted++
+            } catch (e: Exception) {
+                failed++
+                Log.e(TAG, "l2s elim failed for ${f.absolutePath}: ${e.message}")
+            }
+        }
+        Log.d(TAG, "l2s elim: converted=$converted broken=$broken failed=$failed")
+
+        // Now delete the central .l2s/ dir and any stray .l2s.NNN backing
+        // files that may have been scattered elsewhere by older proot builds.
+        try {
+            l2sDir.deleteRecursively()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to delete $l2sBasePath", e)
+        }
+        rootfsDir.walkTopDown().forEach { f ->
+            if (f.name.startsWith(".l2s.") && f.isFile) {
+                try {
+                    f.delete()
+                } catch (_: Exception) {}
+            }
+        }
+
+        // Belt-and-suspenders: make sure dpkg's core DB files exist as plain
+        // empty files if anything went wrong above. An empty status/available
+        // is legal for dpkg (zero packages tracked).
+        val dpkgDir = File(rootfsDir, "var/lib/dpkg")
+        if (dpkgDir.exists()) {
+            listOf("status", "available", "status-old", "available-old").forEach { name ->
+                val f = File(dpkgDir, name)
+                if (!f.exists()) {
+                    try {
+                        f.createNewFile()
+                        f.setReadable(true, false)
+                        f.setWritable(true, false)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to create fallback $name", e)
+                    }
+                }
+            }
+            // Pre-seed status-old from status so dpkg's atomic-rename path
+            // sees the backup file already present.
+            val status = File(dpkgDir, "status")
+            val statusOld = File(dpkgDir, "status-old")
+            if (status.exists() && status.length() > 0 && statusOld.length() == 0L) {
+                try {
+                    status.copyTo(statusOld, overwrite = true)
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    @Suppress("unused") // kept for migration safety; no longer called
+    private fun recoverAndFixDpkgDatabase() {
+        val dpkgDir = File(rootfsDir, "var/lib/dpkg")
+        if (!dpkgDir.exists()) return
+
+        Log.d(TAG, "dpkg dir: ${dpkgDir.list()?.joinToString()}")
+
+        // Step 1 — restore files whose symlink was deleted but backing file remains
+        dpkgDir.listFiles { f -> f.name.startsWith(".l2s.") }?.forEach { l2sFile ->
+            val baseName = l2sFile.name.removePrefix(".l2s.").trimEnd { it.isDigit() }
+            if (baseName.isEmpty()) return@forEach
+            val target = File(dpkgDir, baseName)
+            if (!target.exists() && l2sFile.length() > 0) {
+                try {
+                    l2sFile.copyTo(target, overwrite = false)
+                    target.setReadable(true, false)
+                    target.setWritable(true, false)
+                    Log.d(TAG, "Recovered: $baseName from ${l2sFile.name} (${l2sFile.length()} B)")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to recover $baseName", e)
+                }
+            }
+        }
+
+        // Step 2 — convert remaining l2s symlinks to plain files
+        listOf("status", "available", "status-old").forEach { name ->
+            val f = File(dpkgDir, name)
+            if (!f.exists()) return@forEach
+            if (!Files.isSymbolicLink(f.toPath())) return@forEach
+            val real = f.canonicalFile
+            if (!real.exists()) return@forEach
+            val tmp = File(dpkgDir, ".fix.$name.tmp")
+            try {
+                real.copyTo(tmp, overwrite = true)
+                Files.delete(f.toPath()) // removes the symlink only
+                tmp.renameTo(f) // destination now absent → plain rename, no l2s magic
+                Log.d(TAG, "Delinked: $name (was -> ${real.name})")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to delink $name", e)
+                tmp.delete()
+            }
+        }
+
+        // Step 3 — ensure status-old exists so dpkg never calls renameat2
+        val status = File(dpkgDir, "status")
+        val statusOld = File(dpkgDir, "status-old")
+        if (status.exists() && !statusOld.exists()) {
+            try {
+                status.copyTo(statusOld, overwrite = false)
+            } catch (_: Exception) {}
+        }
+
+        // Step 4 — last resort: create empty-but-valid files if still missing
+        // An empty status/available is legal; dpkg treats it as zero packages.
+        listOf("status", "available", "status-old").forEach { name ->
+            val f = File(dpkgDir, name)
+            if (!f.exists()) {
+                try {
+                    f.createNewFile()
+                    f.setReadable(true, false)
+                    f.setWritable(true, false)
+                    Log.d(TAG, "Created empty fallback: $name")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to create fallback $name", e)
+                }
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  Pre-built static binaries (replaces apt install)
+    // ─────────────────────────────────────────────────────────────────────
+
+    private fun installPrebuiltBinaries() {
+        val localDir = File(rootfsDir, "usr/local").apply { mkdirs() }
+
+        // ── Python (cpython + pip bundled by python-build-standalone) ──
+        // Tarball top-level is "python/", so extract into usr/local/ →
+        // /usr/local/python/bin/python3 + /usr/local/python/bin/pip3.
+        val pythonMarker =
+                File(localDir, ".python-installed.v$PYTHON_SCHEMA_VERSION.${PYTHON_URL.hashCode()}")
+        val pythonRoot = File(localDir, "python")
+        if (!pythonMarker.exists() || !File(pythonRoot, "bin/python3").exists()) {
+            progress("Installing Python (with pip)…", 0.87f)
+            try {
+                val tarball = File(baseDir, "python.tar.gz")
+                downloadFile(PYTHON_URL, tarball, "Python")
+                if (pythonRoot.exists()) pythonRoot.deleteRecursively()
+                extractArchive(tarball, localDir)
+                tarball.delete()
+                pythonMarker.createNewFile()
+                appendLog("Python installed at /usr/local/python")
+            } catch (e: Exception) {
+                Log.e(TAG, "Python install failed", e)
+                appendLog("Python install failed: ${e.message}")
+            }
+        }
+
+        // ── Node.js (node + npm bundled by nodejs.org official build) ──
+        // Tarball top-level is "node-vX.Y.Z-linux-arm64/" — rename to "node"
+        // after extract so we get a stable /usr/local/node/bin/node path.
+        val nodeMarker =
+                File(localDir, ".node-installed.v$NODE_SCHEMA_VERSION.${NODE_URL.hashCode()}")
+        val nodeRoot = File(localDir, "node")
+        if (!nodeMarker.exists() || !File(nodeRoot, "bin/node").exists()) {
+            progress("Installing Node.js (with npm)…", 0.93f)
+            try {
+                val tarball = File(baseDir, "node.tar.xz")
+                downloadFile(NODE_URL, tarball, "Node.js")
+                if (nodeRoot.exists()) nodeRoot.deleteRecursively()
+                extractArchive(tarball, localDir)
+                tarball.delete()
+                val extractedDir =
+                        localDir.listFiles()?.firstOrNull {
+                            it.isDirectory && it.name.startsWith("node-v")
+                        }
+                if (extractedDir != null) {
+                    extractedDir.renameTo(nodeRoot)
+                }
+                // Flatten symlinks inside node_modules so proot doesn't
+                // need to resolve them (its resolution often fails with
+                // ENOSYS/ENOENT). Replaces every symlink whose target
+                // is inside the node tree with a real copy.
+                resolveNodeModuleSymlinks(nodeRoot)
+                nodeMarker.createNewFile()
+                appendLog("Node.js installed at /usr/local/node")
+            } catch (e: Exception) {
+                Log.e(TAG, "Node.js install failed", e)
+                appendLog("Node.js install failed: ${e.message}")
+            }
+        }
+
+        // ── Make sure both are in PATH for interactive shells ──
+        val profileDir = File(rootfsDir, "etc/profile.d").apply { mkdirs() }
+        File(profileDir, "01-cloudide-prebuilt.sh")
+                .writeText(
+                        """#!/bin/sh
+            # Pre-built binaries (no apt needed)
+            export PATH=/usr/local/bin:/usr/local/python/bin:/usr/local/node/bin:${'$'}PATH
+            # Node.js module resolution — ensures npm can find its own modules
+            export NODE_PATH=/usr/local/node/lib/node_modules
+
+            # 'workspace' command — cd to the project folder
+            workspace() {
+                if [ -d "/workspace" ]; then
+                    cd /workspace
+                    echo "Switched to project workspace: $(pwd)"
+                else
+                    echo "No project workspace is mounted."
+                fi
+            }
+            """.trimIndent() +
+                                "\n"
+                )
+
+        // ── Global Python sitecustomize.py: patch os.getcwd ENOSYS ─────────
+        // Python's site.py auto-imports `sitecustomize` during startup, so
+        // placing this file in site-packages/ wraps os.getcwd before any
+        // user code runs. If proot's getcwd returns ENOSYS, fall back to
+        // the PWD env var (always set by bash) or "/".
+        if (pythonRoot.exists()) {
+            val pyVer0 =
+                    File(pythonRoot, "lib")
+                            .listFiles()
+                            ?.firstOrNull { it.name.startsWith("python") && it.isDirectory }
+                            ?.name
+                            ?: "python3.14"
+            val siteCustomize = File(pythonRoot, "lib/$pyVer0/site-packages/sitecustomize.py")
+            try {
+                siteCustomize.parentFile?.mkdirs()
+                siteCustomize.writeText(
+                        """
+                    # CloudIde: patch os.getcwd() for proot's ENOSYS.
+                    # proot on this device raises OSError(38, "Function not
+                    # implemented") for getcwd(). Fall back to PWD or '/'.
+                    import os as _cloudide_os
+
+                    def _cloudide_getcwd_fallback():
+                        return _cloudide_os.environ.get('PWD') or '/'
+
+                    # Patch Python-level os.getcwd
+                    _cloudide_real_getcwd = _cloudide_os.getcwd
+                    def _cloudide_getcwd():
+                        try:
+                            return _cloudide_real_getcwd()
+                        except OSError:
+                            return _cloudide_getcwd_fallback()
+                    _cloudide_os.getcwd = _cloudide_getcwd
+
+                    # Patch os.getcwdb (bytes variant)
+                    try:
+                        _cloudide_real_getcwdb = _cloudide_os.getcwdb
+                        def _cloudide_getcwdb():
+                            try:
+                                return _cloudide_real_getcwdb()
+                            except OSError:
+                                return _cloudide_getcwd_fallback().encode()
+                        _cloudide_os.getcwdb = _cloudide_getcwdb
+                    except AttributeError:
+                        pass
+
+                    # CRITICAL: Also patch posix.getcwd.
+                    # importlib._bootstrap_external imports posix as _os and
+                    # calls _os.getcwd() directly — bypassing our os.getcwd
+                    # patch above. Without this, `import langchain` (and other
+                    # packages with namespace-package path scanning) fails with
+                    # OSError(38) because _path_importer_cache hits getcwd()
+                    # when sys.path contains an empty string ('').
+                    try:
+                        import posix as _cloudide_posix
+                        _cloudide_real_posix_getcwd = _cloudide_posix.getcwd
+                        def _cloudide_posix_getcwd():
+                            try:
+                                return _cloudide_real_posix_getcwd()
+                            except OSError:
+                                return _cloudide_getcwd_fallback()
+                        _cloudide_posix.getcwd = _cloudide_posix_getcwd
+                    except Exception:
+                        pass
+                    """.trimIndent() +
+                                "\n"
+                )
+                appendLog("Installed Python sitecustomize.py (getcwd fallback)")
+            } catch (e: Exception) {
+                Log.w(TAG, "sitecustomize install failed: ${e.message}")
+            }
+        }
+
+        // ── Patch pip's vendored rich for proot's getcwd() ENOSYS ───────────
+        // pip → import rich.console → rich/__init__.py line 17:
+        //     _IMPORT_CWD = os.path.abspath(os.getcwd())
+        // proot's getcwd raises OSError(38, "Function not implemented") on
+        // this device. Patch to fall back to "/" on OSError. Affects only
+        // pip's vendored copy (other rich users on the device are unaffected).
+        if (pythonRoot.exists()) {
+            val pyVer =
+                    File(pythonRoot, "lib")
+                            .listFiles()
+                            ?.firstOrNull { it.name.startsWith("python") && it.isDirectory }
+                            ?.name
+                            ?: "python3.14"
+            val richInit = File(pythonRoot, "lib/$pyVer/site-packages/pip/_vendor/rich/__init__.py")
+            if (richInit.exists()) {
+                try {
+                    // INLINE text replacement: swap os.getcwd() with a
+                    // safe constant INSIDE the existing try/except block,
+                    // preserving all surrounding structure and indentation.
+                    // Previous approach dropped try:/except lines which
+                    // orphaned the indented body → IndentationError.
+                    val original = richInit.readText()
+                    if (original.contains("os.getcwd") && !original.contains("CLOUDIDE-PATCHED")) {
+                        val patched =
+                                original.replace(
+                                                "os.path.abspath(os.getcwd())",
+                                                "'/'  # CLOUDIDE-PATCHED"
+                                        )
+                                        .replace("os.getcwd()", "'/'  # CLOUDIDE-PATCHED")
+                        richInit.writeText(patched)
+                        appendLog("Patched pip's vendored rich (getcwd fallback)")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "rich patch failed: ${e.message}")
+                }
+            }
+        }
+
+        // ── /usr/local/bin/{npm,npx,corepack} bypass-env wrappers ──────────
+        // The original scripts at /usr/local/node/bin/{npm,npx,corepack} use
+        // `#!/usr/bin/env node`. env's PATH lookup triggers some syscall that
+        // proot returns ENOSYS for, producing "/usr/bin/env: 'node': Function
+        // not implemented". Replace with direct shell wrappers that invoke
+        // the node binary by absolute path.
+        if (nodeRoot.exists()) {
+            // Use Linux-internal paths (inside proot, rootfs is /).
+            // Previously we used .canonicalPath which resolved to Android
+            // host paths like /data/user/0/com.cloudide.../  — Node.js
+            // then couldn't find node_modules/which/isexe relative to
+            // those paths (MODULE_NOT_FOUND).
+            val nodeBin = "/usr/local/node/bin/node"
+            val nodeModulesBase = "/usr/local/node/lib/node_modules"
+            val wrappers =
+                    mapOf(
+                            "npm" to "$nodeModulesBase/npm/bin/npm-cli.js",
+                            "npx" to "$nodeModulesBase/npm/bin/npx-cli.js",
+                            "corepack" to "$nodeModulesBase/corepack/dist/corepack.js"
+                    )
+            val D = "${'$'}"
+            // Check existence using host-side paths for the guard
+            val hostNodeModules = File(nodeRoot, "lib/node_modules")
+            wrappers.forEach { (name, scriptPath) ->
+                val hostScript = File(rootfsDir, scriptPath.removePrefix("/"))
+                if (hostScript.exists()) {
+                    File(rootfsDir, "usr/local/bin/$name").apply {
+                        parentFile?.mkdirs()
+                        writeText("#!/bin/sh\n" + "exec $nodeBin $scriptPath \"${D}@\"\n")
+                        setExecutable(true, false)
+                    }
+                }
+            }
+            appendLog("Installed env-free wrappers for npm/npx/corepack")
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  Rootfs layout normalization
+    // ─────────────────────────────────────────────────────────────────────
+
+    private fun normalizeRootfsLayout() {
+        if (File(rootfsDir, "etc/os-release").exists()) return
+        val nestedRoot =
+                rootfsDir.listFiles()?.firstOrNull { File(it, "etc/os-release").exists() } ?: return
+        nestedRoot.listFiles()?.forEach { child ->
+            val target = File(rootfsDir, child.name)
+            if (!target.exists()) child.renameTo(target)
+        }
+        nestedRoot.deleteRecursively()
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  Asset / download / archive helpers
+    // ─────────────────────────────────────────────────────────────────────
 
     private fun extractAsset(assetName: String, target: File) {
         target.parentFile?.mkdirs()
         context.assets.open(assetName).use { input ->
-            FileOutputStream(target).use { output ->
-                val buffer = ByteArray(8192)
-                while (true) {
-                    val n = input.read(buffer)
-                    if (n <= 0) break
-                    output.write(buffer, 0, n)
-                }
-            }
+            FileOutputStream(target).use { output -> input.copyTo(output) }
         }
-        Log.d(TAG, "Extracted asset $assetName → ${target.absolutePath} (${target.length()} bytes)")
     }
 
-    @Suppress("unused")
-    private fun downloadWithFallback(urls: List<String>, target: File): Boolean {
-        val errors = mutableListOf<String>()
+    private fun downloadWithFallback(urls: List<String>, target: File) {
+        var lastError: Exception? = null
         for (url in urls) {
             try {
-                Log.d(TAG, "Trying download: $url")
                 downloadFile(url, target)
-                if (target.exists() && target.length() > 1000) {
-                    return true
-                }
+                return
             } catch (e: Exception) {
-                errors += "${url}: ${e.message}"
-                Log.w(TAG, "Download failed: $url — ${e.message}")
+                lastError = e
+                appendLog("Download from $url failed: ${e.message}")
             }
         }
-        Log.e(TAG, "All download URLs failed: $errors")
-        return false
+        throw lastError ?: Exception("All download URLs failed")
     }
 
-    private fun downloadFile(
-            url: String,
-            target: File,
-            onProgress: ((downloaded: Long, total: Long) -> Unit)? = null,
-    ) {
+    private fun downloadFile(url: String, target: File, label: String = "Ubuntu rootfs") {
         var currentUrl = url
         var hop = 0
         while (hop++ < 10) {
@@ -609,67 +1197,62 @@ class ProotEnvironment(internal val context: Context) {
             connection.readTimeout = 120_000
             connection.instanceFollowRedirects = false
             connection.setRequestProperty("User-Agent", "CloudIDE-Android/1.0")
-
             val code = connection.responseCode
-            Log.d(TAG, "Download hop $hop: $currentUrl → HTTP $code")
-
-            if (code == HttpURLConnection.HTTP_MOVED_TEMP ||
-                            code == HttpURLConnection.HTTP_MOVED_PERM ||
-                            code == 307 ||
-                            code == 308
-            ) {
-                val location = connection.getHeaderField("Location")
-                connection.disconnect()
-                if (location.isNullOrBlank()) {
-                    throw RuntimeException("Redirect with no Location header from $currentUrl")
-                }
+            if (code in listOf(301, 302, 307, 308)) {
                 currentUrl =
-                        if (location.startsWith("http")) location
-                        else URL(URL(currentUrl), location).toString()
+                        connection.getHeaderField("Location")
+                                ?: throw Exception("Redirect without Location header")
+                connection.disconnect()
                 continue
             }
-
             if (code != HttpURLConnection.HTTP_OK) {
                 connection.disconnect()
-                throw RuntimeException("HTTP $code for $currentUrl")
+                throw Exception("HTTP $code from $currentUrl")
             }
-
-            val totalSize = connection.contentLengthLong
-            try {
-                BufferedInputStream(connection.inputStream).use { input ->
-                    FileOutputStream(target).use { output ->
-                        val buffer = ByteArray(32768)
-                        var downloaded = 0L
-                        var lastReport = 0L
-                        while (true) {
-                            val n = input.read(buffer)
-                            if (n <= 0) break
-                            output.write(buffer, 0, n)
-                            downloaded += n
-                            if (downloaded - lastReport >= 262_144) {
-                                onProgress?.invoke(downloaded, totalSize)
-                                lastReport = downloaded
+            val totalBytes = connection.contentLengthLong
+            connection.inputStream.use { input ->
+                FileOutputStream(target).use { output ->
+                    val buf = ByteArray(64 * 1024)
+                    var copied = 0L
+                    var nextLogAt = 1024L * 1024L
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        output.write(buf, 0, n)
+                        copied += n
+                        if (copied >= nextLogAt) {
+                            val mb = copied / (1024L * 1024L)
+                            val frac =
+                                    if (totalBytes > 0) (copied.toDouble() / totalBytes.toDouble())
+                                    else 0.0
+                            val overall = (0.20f + 0.35f * frac.toFloat()).coerceIn(0.20f, 0.55f)
+                            if (totalBytes > 0) {
+                                val totalMb = totalBytes / (1024L * 1024L)
+                                progress("Downloading $label… ${mb} / ${totalMb} MB", overall)
+                            } else {
+                                progress("Downloading $label… ${mb} MB", overall)
                             }
+                            nextLogAt = copied + 4L * 1024L * 1024L
                         }
-                        onProgress?.invoke(downloaded, totalSize)
                     }
                 }
-                Log.d(
-                        TAG,
-                        "Downloaded $currentUrl → ${target.absolutePath} (${target.length()} bytes)"
-                )
-                return
-            } finally {
-                connection.disconnect()
             }
+            connection.disconnect()
+            return
         }
-        throw RuntimeException("Too many redirects for $url")
+        throw Exception("Too many redirects for $url")
     }
 
-    private fun extractTarGz(tarGzFile: File, targetDir: File) {
-        targetDir.mkdirs()
-        GZIPInputStream(BufferedInputStream(tarGzFile.inputStream())).use { gzip ->
-            extractTar(gzip, targetDir)
+    private fun extractArchive(archive: File, destDir: File) {
+        destDir.mkdirs()
+        BufferedInputStream(archive.inputStream()).use { input ->
+            when {
+                archive.name.endsWith(".tar.xz") || archive.name.endsWith(".xz") ->
+                        XZInputStream(input).use { xz -> extractTar(xz, destDir) }
+                archive.name.endsWith(".tar.gz") || archive.name.endsWith(".tgz") ->
+                        GZIPInputStream(input).use { gz -> extractTar(gz, destDir) }
+                else -> extractTar(input, destDir)
+            }
         }
     }
 
@@ -696,22 +1279,18 @@ class ProotEnvironment(internal val context: Context) {
                     } catch (_: NumberFormatException) {
                         0L
                     }
-
             val mode =
                     try {
                         if (modeOctal.isNotEmpty()) modeOctal.toInt(8) else 0x1FF
                     } catch (_: NumberFormatException) {
                         0x1FF
                     }
-
             val type = typeFlag.toInt().toChar()
 
-            // PAX extended header
             if (type == 'x' || type == 'g') {
                 val paxData = ByteArray(size.toInt())
                 readFully(input, paxData)
-                val padding = (512 - (size % 512)) % 512
-                skipBytes(input, padding)
+                skipBytes(input, (512 - (size % 512)) % 512)
                 val paxStr = String(paxData, Charsets.UTF_8)
                 for (line in paxStr.split("\n")) {
                     val eqIdx = line.indexOf('=')
@@ -726,20 +1305,18 @@ class ProotEnvironment(internal val context: Context) {
                 }
                 continue
             }
-
-            // GNU long name / long link
             if (type == 'L') {
-                val nameData = ByteArray(size.toInt())
-                readFully(input, nameData)
+                val d = ByteArray(size.toInt())
+                readFully(input, d)
                 skipBytes(input, (512 - (size % 512)) % 512)
-                longName = String(nameData, Charsets.UTF_8).trimEnd('\u0000')
+                longName = String(d, Charsets.UTF_8).trimEnd(' ')
                 continue
             }
             if (type == 'K') {
-                val nameData = ByteArray(size.toInt())
-                readFully(input, nameData)
+                val d = ByteArray(size.toInt())
+                readFully(input, d)
                 skipBytes(input, (512 - (size % 512)) % 512)
-                longLinkName = String(nameData, Charsets.UTF_8).trimEnd('\u0000')
+                longLinkName = String(d, Charsets.UTF_8).trimEnd(' ')
                 continue
             }
 
@@ -748,69 +1325,136 @@ class ProotEnvironment(internal val context: Context) {
             longName = null
             longLinkName = null
 
+            // Resolve the output file. We avoid File.canonicalFile() here
+            // because it can throw IOException on perfectly valid filenames
+            // (Node's bundled node_modules has files where canonicalFile
+            // fails, causing us to skip critical .js files and break npm).
+            // Instead we do a plain string-based path-traversal check that
+            // never throws.
             val outFile = File(targetDir, fullName)
+            val outAbs = outFile.absolutePath
+            val targetAbs = targetDir.absolutePath
+            if (outAbs != targetAbs && !outAbs.startsWith("$targetAbs/")) {
+                // Path-traversal attempt (e.g. ../../etc/passwd) — skip.
+                skipBytes(input, size)
+                skipBytes(input, (512 - (size % 512)) % 512)
+                continue
+            }
 
-            when (type) {
-                '5', 'D' -> {
-                    outFile.mkdirs()
-                    applyPermissions(outFile, mode)
-                }
-                '2' -> {
-                    outFile.parentFile?.mkdirs()
-                    try {
-                        java.nio.file.Files.createSymbolicLink(
-                                outFile.toPath(),
-                                java.nio.file.Paths.get(effectiveLinkName)
-                        )
-                    } catch (_: Exception) {}
-                    skipBytes(input, size)
-                }
-                '1' -> {
-                    outFile.parentFile?.mkdirs()
-                    val linkTarget = File(targetDir, effectiveLinkName)
-                    try {
-                        if (linkTarget.exists()) {
-                            linkTarget.copyTo(outFile, overwrite = true)
-                            applyPermissions(outFile, mode)
-                        }
-                    } catch (_: Exception) {}
-                    skipBytes(input, size)
-                }
-                '0', '\u0000' -> {
-                    if (fullName.isNotEmpty() && !fullName.endsWith("/")) {
-                        outFile.parentFile?.mkdirs()
-                        FileOutputStream(outFile).use { fos ->
-                            var remaining = size
-                            val buffer = ByteArray(8192)
-                            while (remaining > 0) {
-                                val toRead = minOf(remaining.toInt(), buffer.size)
-                                val n = input.read(buffer, 0, toRead)
-                                if (n <= 0) break
-                                fos.write(buffer, 0, n)
-                                remaining -= n
-                            }
-                        }
+            try {
+                when (type) {
+                    '5', 'D' -> {
+                        outFile.mkdirs()
                         applyPermissions(outFile, mode)
-                        val padding = (512 - (size % 512)) % 512
-                        skipBytes(input, padding)
-                    } else {
+                    }
+                    '2' -> {
+                        outFile.parentFile?.mkdirs()
+                        try {
+                            Files.deleteIfExists(outFile.toPath())
+                            Files.createSymbolicLink(outFile.toPath(), Paths.get(effectiveLinkName))
+                        } catch (_: Exception) {}
                         skipBytes(input, size)
                     }
-                }
-                else -> {
-                    if (size > 0) {
+                    '1' -> {
+                        outFile.parentFile?.mkdirs()
+                        val lt = File(targetDir, effectiveLinkName)
+                        try {
+                            if (lt.exists()) {
+                                lt.copyTo(outFile, overwrite = true)
+                                applyPermissions(outFile, mode)
+                            }
+                        } catch (_: Exception) {}
                         skipBytes(input, size)
-                        val padding = (512 - (size % 512)) % 512
-                        skipBytes(input, padding)
+                    }
+                    '0', ' ' -> {
+                        if (fullName.isNotEmpty() && !fullName.endsWith("/")) {
+                            outFile.parentFile?.mkdirs()
+                            FileOutputStream(outFile).use { fos ->
+                                var rem = size
+                                val buf = ByteArray(8192)
+                                while (rem > 0) {
+                                    val n = input.read(buf, 0, minOf(rem.toInt(), buf.size))
+                                    if (n <= 0) break
+                                    fos.write(buf, 0, n)
+                                    rem -= n
+                                }
+                            }
+                            applyPermissions(outFile, mode)
+                            skipBytes(input, (512 - (size % 512)) % 512)
+                        } else {
+                            skipBytes(input, size)
+                        }
+                    }
+                    else -> {
+                        if (size > 0) {
+                            skipBytes(input, size)
+                            skipBytes(input, (512 - (size % 512)) % 512)
+                        }
                     }
                 }
+            } catch (e: Exception) {
+                // Per-entry failure (e.g., FS rejects the name, link target
+                // contains invalid chars, parent dir creation fails on a
+                // weird path). Log and continue with the next entry.
+                Log.w(TAG, "tar: error on entry '$fullName': ${e.message}")
             }
         }
     }
 
+    private fun resolveNodeModuleSymlinks(nodeRoot: File) {
+        if (!nodeRoot.exists()) return
+        appendLog("Flattening symlinks in Node.js installation…")
+        var flattened = 0
+        var failed = 0
+        nodeRoot.walkTopDown().forEach { f ->
+            try {
+                if (Files.isSymbolicLink(f.toPath())) {
+                    val resolved =
+                            try {
+                                f.canonicalFile
+                            } catch (_: Exception) {
+                                null
+                            }
+                    if (resolved != null && resolved.exists() && resolved.isFile) {
+                        val tmp = File(f.parentFile, ".symfix.${f.name}.tmp")
+                        resolved.copyTo(tmp, overwrite = true)
+                        tmp.setExecutable(resolved.canExecute(), false)
+                        // Atomically replace the symlink with the real file.
+                        // Files.move(REPLACE_EXISTING) replaces the symlink in
+                        // one kernel call — if it fails (cross-device) we fall
+                        // back to copy+delete.  The old code did delete() then
+                        // renameTo() and never checked the boolean return value:
+                        // if renameTo failed the file was permanently lost.
+                        try {
+                            Files.move(
+                                    tmp.toPath(),
+                                    f.toPath(),
+                                    java.nio.file.StandardCopyOption.REPLACE_EXISTING
+                            )
+                        } catch (_: Exception) {
+                            // Cross-device fallback: delete symlink then copy
+                            try {
+                                Files.deleteIfExists(f.toPath())
+                                tmp.copyTo(f, overwrite = true)
+                                f.setExecutable(resolved.canExecute(), false)
+                            } finally {
+                                tmp.delete()
+                            }
+                        }
+                        flattened++
+                    }
+                }
+            } catch (e: Exception) {
+                failed++
+                Log.w(TAG, "Symlink flatten failed for ${f.name}: ${e.message}")
+            }
+        }
+        appendLog("Flattened $flattened Node.js symlinks (failed: $failed)")
+    }
+
     private fun applyPermissions(file: File, mode: Int) {
-        val ownerExec = (mode and 0b001_000_000) != 0
         val anyExec = (mode and 0b001_001_001) != 0
+        val ownerExec = (mode and 0b001_000_000) != 0
         if (anyExec) file.setExecutable(true, !ownerExec)
         file.setReadable(true, false)
         file.setWritable(true, true)
@@ -838,190 +1482,27 @@ class ProotEnvironment(internal val context: Context) {
     }
 
     private fun skipBytes(input: java.io.InputStream, count: Long) {
-        var remaining = count
-        val buffer = ByteArray(8192)
-        while (remaining > 0) {
-            val toSkip = minOf(remaining.toInt(), buffer.size)
-            val n = input.read(buffer, 0, toSkip)
+        var rem = count
+        val buf = ByteArray(8192)
+        while (rem > 0) {
+            val n = input.read(buf, 0, minOf(rem.toInt(), buf.size))
             if (n <= 0) break
-            remaining -= n
+            rem -= n
         }
     }
 
-    private fun configureRootfs() {
-        // DNS
-        val resolvConf = File(rootfsDir, "etc/resolv.conf")
-        resolvConf.parentFile?.mkdirs()
-        resolvConf.writeText("nameserver 8.8.8.8\nnameserver 8.8.4.4\n")
-
-        // Alpine package repos
-        val reposFile = File(rootfsDir, "etc/apk/repositories")
-        reposFile.parentFile?.mkdirs()
-        reposFile.writeText(
-                "https://dl-cdn.alpinelinux.org/alpine/v$ALPINE_VERSION/main\n" +
-                        "https://dl-cdn.alpinelinux.org/alpine/v$ALPINE_VERSION/community\n"
-        )
-
-        // /etc/profile.d/cloudide.sh — loaded by every login shell
-        val profileDir = File(rootfsDir, "etc/profile.d")
-        profileDir.mkdirs()
-        File(profileDir, "cloudide.sh")
-                .writeText(
-                        """
-            export HOME=/root
-            export NODE_PATH=/opt/packages/node_modules
-            export PYTHONPATH=/opt/packages/python_packages
-            export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-            export TERM=xterm-256color
-            export LANG=C.UTF-8
-            export PS1='cloudide:\w$ '
-            export LD_LIBRARY_PATH=/usr/lib:/lib:/usr/local/lib
-
-            npm_global() { npm install --prefix /opt/packages "${'$'}@"; }
-            pip_global()  { pip3 install --target=/opt/packages/python_packages "${'$'}@"; }
-        """.trimIndent() +
-                                "\n"
-                )
-
-        // /root/.profile — sources profile.d and prints banner
-        val rootProfile = File(rootfsDir, "root/.profile")
-        rootProfile.parentFile?.mkdirs()
-        rootProfile.writeText(
-                """
-            . /etc/profile
-
-            echo "CloudIDE Terminal (Alpine Linux v$ALPINE_VERSION)"
-            echo "  node_modules: /opt/packages/node_modules"
-            echo "  python pkgs:  /opt/packages/python_packages"
-            echo "  Use npm_global <pkg> / pip_global <pkg> to install globally."
-            echo ""
-        """.trimIndent() +
-                        "\n"
-        )
-
-        // .npmrc
-        File(rootfsDir, "root/.npmrc").writeText("prefix=/opt/packages\n")
-
-        Log.d(TAG, "rootfs configured")
+    private fun progress(step: String, progress: Float) {
+        _setupState.value = SetupState.InProgress(step, progress)
+        appendLog(step)
     }
 
-    private fun fixBusyboxSymlinks() {
-        // Fix musl dynamic linker symlink
-        val libDir = File(rootfsDir, "lib")
-        libDir.mkdirs()
-        val musl = File(libDir, "libc.musl-aarch64.so.1")
-        val ldMusl = File(libDir, "ld-musl-aarch64.so.1")
-        if (musl.exists() && (!ldMusl.exists() || ldMusl.length() == 0L)) {
-            try {
-                musl.copyTo(ldMusl, overwrite = true)
-                ldMusl.setExecutable(true, false)
-                Log.d(TAG, "Fixed musl linker: ${musl.name} → ${ldMusl.name}")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to fix musl linker: ${e.message}")
-            }
-        }
-
-        // Fix busybox symlinks (Android can't create symlinks during extraction)
-        val busybox = File(rootfsDir, "bin/busybox")
-        if (!busybox.exists()) {
-            Log.e(TAG, "busybox not found — extraction may have failed")
-            return
-        }
-
-        val criticalBins =
-                listOf(
-                        "bin/sh",
-                        "bin/ash",
-                        "bin/cat",
-                        "bin/ls",
-                        "bin/mkdir",
-                        "bin/rm",
-                        "bin/cp",
-                        "bin/mv",
-                        "bin/ln",
-                        "bin/chmod",
-                        "bin/chown",
-                        "bin/sed",
-                        "bin/grep",
-                        "bin/tar",
-                        "bin/mount",
-                        "bin/umount",
-                        "bin/ps",
-                        "bin/kill",
-                        "bin/echo",
-                        "bin/test",
-                        "bin/true",
-                        "bin/false",
-                        "bin/sleep",
-                        "bin/date",
-                        "bin/uname",
-                        "bin/hostname",
-                        "bin/dd",
-                        "bin/df",
-                        "bin/du",
-                        "bin/mktemp",
-                        "usr/bin/env",
-                        "usr/bin/head",
-                        "usr/bin/tail",
-                        "usr/bin/which",
-                        "usr/bin/id",
-                        "usr/bin/basename",
-                        "usr/bin/dirname",
-                        "usr/bin/wc",
-                        "usr/bin/sort",
-                        "usr/bin/uniq",
-                        "usr/bin/cut",
-                        "usr/bin/tr",
-                        "usr/bin/xargs",
-                        "usr/bin/find",
-                        "usr/bin/tee",
-                        "usr/bin/printf",
-                        "usr/bin/expr",
-                        "usr/bin/wget",
-                        "usr/bin/awk",
-                        "usr/bin/diff",
-                        "usr/bin/patch",
-                        "usr/bin/install",
-                        "usr/bin/readlink",
-                        "usr/bin/realpath",
-                )
-
-        var fixedCount = 0
-        val busyboxBytes = busybox.readBytes()
-        for (binPath in criticalBins) {
-            val target = File(rootfsDir, binPath)
-            if (!target.exists() || target.length() == 0L) {
-                target.parentFile?.mkdirs()
-                try {
-                    target.writeBytes(busyboxBytes)
-                    target.setExecutable(true, false)
-                    fixedCount++
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to copy busybox to $binPath: ${e.message}")
-                }
-            }
-        }
-        Log.d(TAG, "Fixed $fixedCount busybox symlinks + musl linker")
+    private fun fail(message: String) {
+        _setupState.value = SetupState.Failed(message)
+        appendLog(message)
     }
 
-    /**
-     * Reset the toolchain-ready flag so that installToolchains() will run again.
-     * Use when the previous install was incomplete or packages were updated.
-     */
-    fun resetToolchainFlag() {
-        prefs.edit().putBoolean(KEY_TOOLCHAIN_READY, false).apply()
-        Log.d(TAG, "Toolchain ready flag reset")
+    private fun appendLog(message: String) {
+        Log.d(TAG, message)
+        _setupLogs.value = _setupLogs.value + listOf(message)
     }
-
-    /**
-     * Wipe the entire proot environment and start fresh. Call this when upgrading ALPINE_VERSION or
-     * after a failed install.
-     */
-    suspend fun reset() =
-            withContext(Dispatchers.IO) {
-                baseDir.deleteRecursively()
-                prefs.edit().clear().apply()
-                _setupState.value = SetupState.NotStarted
-                Log.d(TAG, "Environment reset")
-            }
 }

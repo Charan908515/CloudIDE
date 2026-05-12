@@ -10,7 +10,7 @@ node_modules/
 .pnp
 .pnp.js
 .yarn/install-state.gz
-
+images/
 # -----------------------------------------------------------------------------
 # Environment Variables (NEVER commit secrets)
 # -----------------------------------------------------------------------------

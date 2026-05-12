@@ -7,11 +7,14 @@ plugins {
 android {
     namespace = "com.cloudide.android"
     compileSdk = 34
+    // Pin to the working NDK install. AGP otherwise auto-selects 26.1.10909125
+    // which on this machine is a partial install missing source.properties.
+    ndkVersion = "27.1.12297006"
 
     defaultConfig {
         applicationId = "com.cloudide.android"
-        minSdk = 26
-        targetSdk = 34
+        minSdk = 24
+        targetSdk = 28 // Legacy mode: disables W^X / seccomp / Phantom Process Killer
         versionCode = 1
         versionName = "1.0.0"
 
@@ -21,6 +24,24 @@ android {
             ?: System.getenv("GOOGLE_WEB_CLIENT_ID")
             ?: ""
         buildConfigField("String", "GOOGLE_WEB_CLIENT_ID", "\"$webClientId\"")
+
+        // Build only arm64 (matches the bundled libproot.so).
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
+        externalNativeBuild {
+            cmake {
+                cFlags += listOf("-Wall", "-Wextra")
+            }
+        }
+    }
+
+    // CMake build of libcloudide-pty.so (forkpty/exec wrapper for the shell).
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     buildTypes {
@@ -51,6 +72,15 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+        // AGP 8.x defaults useLegacyPackaging=false, which forces
+        // extractNativeLibs=false in the merged manifest regardless of what
+        // AndroidManifest.xml says. Flip it so the installer actually extracts
+        // lib/<abi>/libproot.so (and the loader stubs + libtalloc) to
+        // nativeLibraryDir as real files — required to exec libproot via
+        // ProcessBuilder. Without this, proot fails to launch on AGP 8 builds.
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 }
 
@@ -75,6 +105,7 @@ dependencies {
     implementation(libs.coil.compose)
     implementation(libs.androidx.work.runtime.ktx)
     implementation(libs.androidx.documentfile)
+    implementation(libs.xz)
 
     debugImplementation(libs.androidx.ui.tooling)
 }

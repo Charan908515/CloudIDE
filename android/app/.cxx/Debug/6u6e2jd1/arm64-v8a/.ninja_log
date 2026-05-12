@@ -1,0 +1,5 @@
+# ninja log v5
+1	469	8002000304450247	CMakeFiles/cloudide-pty.dir/pty.c.o	8fb05938c6f42427
+18	555	8002000305107269	CMakeFiles/renameat2-fix.dir/renameat2_fix.c.o	bd393a8e58eab2e0
+556	902	8002000308681539	C:/Users/nchar/OneDrive/Desktop/Electron/android/app/build/intermediates/cxx/Debug/6u6e2jd1/obj/arm64-v8a/librenameat2-fix.so	ec9681360482fa14
+474	927	8002000308890609	C:/Users/nchar/OneDrive/Desktop/Electron/android/app/build/intermediates/cxx/Debug/6u6e2jd1/obj/arm64-v8a/libcloudide-pty.so	5bbadd7e87cf2364
